@@ -1,0 +1,57 @@
+{
+  "profile": {
+    "bot_name": "MyMeetingBot",
+    "workspace_name": "team-alpha",
+    "language": "ko-KR",
+    "timezone": "Asia/Seoul"
+  },
+  "zoom": {
+    "client_id": "YOUR_ZOOM_CLIENT_ID",
+    "client_secret": "YOUR_ZOOM_CLIENT_SECRET",
+    "meeting_sdk_enabled": true,
+    "programmatic_join_enabled": true
+  },
+  "local_ai": {
+    "codex_command": "codex",
+    "huggingface_token": "YOUR_HF_TOKEN",
+    "transcribe_model": "large-v3",
+    "diarization_model": "pyannote/speaker-diarization-community-1",
+    "meeting_output_device": "Realtek HD Audio 2nd output(Realtek(R) Audio)",
+    "pandoc_command": "pandoc",
+    "libreoffice_command": "soffice",
+    "whisper_cpp_command": "",
+    "whisper_cpp_model": ""
+  },
+  "telegram": {
+    "enabled": true,
+    "bot_name": "MyTelegramBot",
+    "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+    "conversation_route": {
+      "mode": "none",
+      "project_id": "",
+      "destination_label": "",
+      "chat_id": ""
+    },
+    "artifact_route": {
+      "mode": "personal_dm",
+      "project_id": "",
+      "destination_label": "",
+      "chat_id": "YOUR_PERSONAL_DM_CHAT_ID"
+    }
+  },
+  "runtime": {
+    "execution_mode": "launcher",
+    "host": "127.0.0.1",
+    "port": 8787,
+    "audio_mode": "conversation",
+    "store_path": "data/delegate_sessions.json",
+    "exports_dir": "data/exports",
+    "audio_archive_dir": "data/audio",
+    "state_path": ".tmp/zoom-meeting-bot/runtime-state.json"
+  },
+  "launcher": {
+    "telegram_runner_backend": "none",
+    "metheus_route_name": "",
+    "state_path": ".tmp/zoom-meeting-bot/launcher-state.json"
+  }
+}

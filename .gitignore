@@ -1,0 +1,11 @@
+.venv/
+.tmp/
+.dist/
+data/
+__pycache__/
+*.py[cod]
+*.egg-info/
+zoom-meeting-bot.config.json
+support-bundle-*.json
+.DS_Store
+Thumbs.db

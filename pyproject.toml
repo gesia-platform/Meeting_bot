@@ -1,0 +1,71 @@
+[project]
+name = "zoom-meeting-bot-cli"
+version = "0.1.0"
+description = "Generic CLI kit for provisioning and operating a local Zoom meeting bot."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx==0.28.1",
+  "numpy>=2.0.0",
+  "python-docx>=1.1.2",
+  "starlette==0.52.1",
+  "uvicorn==0.42.0",
+]
+
+[project.optional-dependencies]
+observer-core = [
+  "mss>=10.1.0",
+  "pillow>=11.0.0",
+  "pyautogui>=0.9.54",
+  "pytesseract>=0.3.13",
+  "soundcard>=0.4.5",
+  "soundfile>=0.13.1",
+]
+observer-windows = [
+  "mss>=10.1.0",
+  "pillow>=11.0.0",
+  "pyautogui>=0.9.54",
+  "pytesseract>=0.3.13",
+  "soundcard>=0.4.5",
+  "soundfile>=0.13.1",
+  "pygetwindow>=0.0.9",
+  "pywinauto>=0.6.9",
+]
+observer-macos = [
+  "mss>=10.1.0",
+  "pillow>=11.0.0",
+  "pyautogui>=0.9.54",
+  "pytesseract>=0.3.13",
+  "soundcard>=0.4.5",
+  "soundfile>=0.13.1",
+  "pygetwindow>=0.0.9",
+]
+observer = [
+  "mss>=10.1.0",
+  "pillow>=11.0.0",
+  "pyautogui>=0.9.54",
+  "pytesseract>=0.3.13",
+  "soundcard>=0.4.5",
+  "soundfile>=0.13.1",
+  "pygetwindow>=0.0.9",
+  "pywinauto>=0.6.9",
+]
+meeting-quality = [
+  "faster-whisper>=1.1.1",
+  "pyannote.audio>=3.3.2",
+]
+
+[project.scripts]
+zoom-meeting-bot = "zoom_meeting_bot_cli.main:main"
+zoom-meeting-bot-runtime = "local_meeting_ai_runtime.__main__:main"
+zoom-meeting-bot-launcher = "lush_local_ai_launcher.__main__:main"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
