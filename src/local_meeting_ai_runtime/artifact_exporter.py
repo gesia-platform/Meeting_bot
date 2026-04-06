@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -27,6 +28,7 @@ class MeetingArtifactExporter:
             command_name="soffice",
             fallbacks=[
                 r"C:\Program Files\LibreOffice\program\soffice.exe",
+                "/Applications/LibreOffice.app/Contents/MacOS/soffice",
             ],
         )
         self._timeout = float(os.getenv("DELEGATE_ARTIFACT_TIMEOUT_SECONDS", "90"))
@@ -42,6 +44,35 @@ class MeetingArtifactExporter:
     @property
     def pdf_ready(self) -> bool:
         return bool(self._pandoc and self._soffice)
+
+    def readiness(self) -> dict[str, Any]:
+        blocking_reasons: list[str] = []
+        quality_notes: list[str] = []
+        if not self._pandoc:
+            blocking_reasons.append("pandoc is not installed for summary.docx export.")
+        if not self._soffice:
+            blocking_reasons.append("LibreOffice is not installed for summary.pdf export.")
+        docx_polish_available = importlib.util.find_spec("docx") is not None
+        if not docx_polish_available:
+            quality_notes.append(
+                "python-docx is not installed, so the DOCX/PDF styling polish layer will be skipped."
+            )
+        reference_doc_ready = bool(self._reference_doc and self._reference_doc.exists())
+        if self._reference_doc and not reference_doc_ready:
+            quality_notes.append(
+                f"Configured reference DOCX was not found: {self._reference_doc}"
+            )
+        return {
+            "docx_ready": bool(self._pandoc),
+            "pdf_ready": self.pdf_ready,
+            "pandoc_path": self._pandoc,
+            "soffice_path": self._soffice,
+            "reference_doc_path": str(self._reference_doc.resolve()) if self._reference_doc else None,
+            "reference_doc_ready": reference_doc_ready,
+            "docx_polish_available": docx_polish_available,
+            "blocking_reasons": blocking_reasons,
+            "quality_notes": quality_notes,
+        }
 
     def export_summary_bundle(self, summary_markdown_path: Path) -> list[dict[str, str]]:
         exports: list[dict[str, str]] = []

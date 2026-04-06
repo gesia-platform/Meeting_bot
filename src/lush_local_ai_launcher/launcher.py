@@ -93,10 +93,15 @@ def start_launcher() -> dict[str, Any]:
 def stop_launcher() -> dict[str, Any]:
     state_path = _state_path()
     state = read_launcher_status()
-    supervisor_pid = int((state.get("supervisor") or {}).get("pid") or 0)
+    supervisor_entry = dict(state.get("supervisor") or {})
+    supervisor_pid = int(supervisor_entry.get("pid") or 0) if bool(supervisor_entry.get("alive")) else 0
+    zoom_entry = dict(state.get("zoom_runtime") or {})
+    runner_entry = dict(state.get("telegram_runner") or {})
+    finalizer_entry = dict(state.get("finalizer") or {})
     child_pids = [
-        int((state.get("zoom_runtime") or {}).get("pid") or 0),
-        int((state.get("telegram_runner") or {}).get("pid") or 0),
+        int(zoom_entry.get("pid") or 0) if bool(zoom_entry.get("alive")) else 0,
+        int(runner_entry.get("pid") or 0) if bool(runner_entry.get("alive")) else 0,
+        int(finalizer_entry.get("pid") or 0) if bool(finalizer_entry.get("alive")) else 0,
     ]
     if supervisor_pid > 0:
         _terminate_pid(supervisor_pid, force=False)
@@ -114,8 +119,16 @@ def stop_launcher() -> dict[str, Any]:
         "stopped_at": utcnow_iso(),
         "supervisor": {"pid": supervisor_pid, "alive": False},
         "zoom_runtime": {"pid": child_pids[0], "alive": False},
-        "telegram_runner": {"pid": child_pids[1], "alive": False},
-        "artifact_bridge": dict(state.get("artifact_bridge") or {}),
+        "telegram_runner": {"pid": child_pids[1], "alive": False, "enabled": _runner_enabled()},
+        "finalizer": {
+            "pid": child_pids[2],
+            "alive": False,
+            "enabled": bool((state.get("finalizer") or {}).get("enabled", _launcher_uses_finisher())),
+        },
+        "artifact_bridge": {
+            **dict(state.get("artifact_bridge") or {}),
+            "status": "idle",
+        },
     }
     _write_json_atomic(state_path, stopped)
     return stopped
@@ -131,30 +144,59 @@ def read_launcher_status() -> dict[str, Any]:
             "supervisor": {"pid": None, "alive": False},
             "zoom_runtime": {"pid": None, "alive": False},
             "telegram_runner": {"pid": None, "alive": False, "enabled": _runner_enabled()},
+            "finalizer": {"pid": None, "alive": False, "enabled": _launcher_uses_finisher()},
             "artifact_bridge": {"status": "idle"},
         }
-    for key in ("supervisor", "zoom_runtime", "telegram_runner"):
+    if str(state.get("status") or "").strip().lower() == "stopped":
+        bridge = dict(state.get("artifact_bridge") or {})
+        bridge["status"] = "idle"
+        state["artifact_bridge"] = bridge
+        for key in ("supervisor", "zoom_runtime", "telegram_runner", "finalizer"):
+            entry = dict(state.get(key) or {})
+            entry["alive"] = False
+            if key == "telegram_runner":
+                entry["enabled"] = bool(entry.get("enabled", _runner_enabled()))
+            if key == "finalizer":
+                entry["enabled"] = bool(entry.get("enabled", _launcher_uses_finisher()))
+            state[key] = entry
+        state["state_path"] = str(state_path)
+        return state
+
+    for key in ("supervisor", "zoom_runtime", "telegram_runner", "finalizer"):
         entry = dict(state.get(key) or {})
         pid = int(entry.get("pid") or 0)
-        entry["alive"] = bool(pid > 0 and _pid_alive(pid))
+        entry["alive"] = bool(pid > 0 and _pid_matches_entry(key, pid, entry))
         if key == "telegram_runner":
             entry["enabled"] = bool(entry.get("enabled", _runner_enabled()))
+        if key == "finalizer":
+            entry["enabled"] = bool(entry.get("enabled", _launcher_uses_finisher()))
         state[key] = entry
     state["status"] = _status_from_process_state(
         supervisor_alive=bool(state["supervisor"]["alive"]),
         zoom_alive=bool(state["zoom_runtime"]["alive"]),
         runner_alive=bool(state["telegram_runner"]["alive"]),
         runner_required=bool(state["telegram_runner"].get("enabled", _runner_enabled())),
+        finalizer_alive=bool(state["finalizer"]["alive"]),
+        finalizer_required=bool(state["finalizer"].get("enabled", _launcher_uses_finisher())),
     )
     state["state_path"] = str(state_path)
     return state
 
 
-def _status_from_process_state(*, supervisor_alive: bool, zoom_alive: bool, runner_alive: bool, runner_required: bool) -> str:
+def _status_from_process_state(
+    *,
+    supervisor_alive: bool,
+    zoom_alive: bool,
+    runner_alive: bool,
+    runner_required: bool,
+    finalizer_alive: bool = False,
+    finalizer_required: bool = False,
+) -> str:
     runner_ok = runner_alive or not runner_required
-    if supervisor_alive and zoom_alive and runner_ok:
+    finalizer_ok = finalizer_alive or not finalizer_required
+    if supervisor_alive and zoom_alive and runner_ok and finalizer_ok:
         return "running"
-    if supervisor_alive or zoom_alive or runner_alive:
+    if supervisor_alive or zoom_alive or runner_alive or finalizer_alive:
         return "degraded"
     return "stopped"
 
@@ -163,9 +205,13 @@ def _terminate_orphan_children(state: dict[str, Any]) -> None:
     supervisor_alive = bool(dict(state.get("supervisor") or {}).get("alive"))
     if supervisor_alive:
         return
+    zoom_entry = dict(state.get("zoom_runtime") or {})
+    runner_entry = dict(state.get("telegram_runner") or {})
+    finalizer_entry = dict(state.get("finalizer") or {})
     orphan_pids = [
-        int((state.get("zoom_runtime") or {}).get("pid") or 0),
-        int((state.get("telegram_runner") or {}).get("pid") or 0),
+        int(zoom_entry.get("pid") or 0) if bool(zoom_entry.get("alive")) else 0,
+        int(runner_entry.get("pid") or 0) if bool(runner_entry.get("alive")) else 0,
+        int(finalizer_entry.get("pid") or 0) if bool(finalizer_entry.get("alive")) else 0,
     ]
     for pid in orphan_pids:
         if pid > 0 and _pid_alive(pid):
@@ -191,6 +237,7 @@ class LauncherSupervisor:
         self._stop_requested = False
         self._zoom_process: subprocess.Popen[Any] | None = None
         self._runner_process: subprocess.Popen[Any] | None = None
+        self._finalizer_process: subprocess.Popen[Any] | None = None
         self._log_handles: list[Any] = []
         self._started_at = utcnow_iso()
 
@@ -205,6 +252,11 @@ class LauncherSupervisor:
             self._runner_process = self._spawn_process(
                 "telegram-runner.log",
                 runner_command,
+            )
+        if _launcher_uses_finisher():
+            self._finalizer_process = self._spawn_process(
+                "meeting-finisher.log",
+                _finisher_command(),
             )
         try:
             self._write_state(status="running")
@@ -240,11 +292,21 @@ class LauncherSupervisor:
     def _write_state(self, *, status: str | None = None) -> None:
         zoom_pid = int(self._zoom_process.pid) if self._zoom_process else None
         runner_pid = int(self._runner_process.pid) if self._runner_process else None
+        finalizer_pid = int(self._finalizer_process.pid) if self._finalizer_process else None
         zoom_alive = bool(zoom_pid and _pid_alive(zoom_pid))
         runner_alive = bool(runner_pid and _pid_alive(runner_pid))
         runner_enabled = _runner_enabled()
         runner_command = _runner_command()
-        current_status = status or ("running" if zoom_alive and (runner_alive or not runner_enabled) else "degraded")
+        finalizer_enabled = _launcher_uses_finisher()
+        finalizer_alive = bool(finalizer_pid and _pid_alive(finalizer_pid))
+        current_status = status or _status_from_process_state(
+            supervisor_alive=True,
+            zoom_alive=zoom_alive,
+            runner_alive=runner_alive,
+            runner_required=runner_enabled,
+            finalizer_alive=finalizer_alive,
+            finalizer_required=finalizer_enabled,
+        )
         payload = {
             "status": current_status,
             "started_at": self._started_at,
@@ -254,6 +316,7 @@ class LauncherSupervisor:
                 "pid": os.getpid(),
                 "alive": current_status != "stopped",
                 "started_at": self._started_at,
+                "command": [sys.executable, "-m", "lush_local_ai_launcher", "_supervise"],
             },
             "zoom_runtime": {
                 "pid": zoom_pid,
@@ -266,12 +329,18 @@ class LauncherSupervisor:
                 "enabled": runner_enabled,
                 "command": runner_command or [],
             },
+            "finalizer": {
+                "pid": finalizer_pid,
+                "alive": finalizer_alive,
+                "enabled": finalizer_enabled,
+                "command": _finisher_command() if finalizer_enabled else [],
+            },
             "artifact_bridge": self._bridge.state_snapshot(),
         }
         _write_json_atomic(self._state_path, payload)
 
     def _shutdown_children(self) -> None:
-        for process in (self._zoom_process, self._runner_process):
+        for process in (self._zoom_process, self._runner_process, self._finalizer_process):
             if process is None:
                 continue
             if process.poll() is None:
@@ -280,13 +349,13 @@ class LauncherSupervisor:
         while time.time() < deadline:
             live = [
                 process
-                for process in (self._zoom_process, self._runner_process)
+                for process in (self._zoom_process, self._runner_process, self._finalizer_process)
                 if process is not None and process.poll() is None
             ]
             if not live:
                 return
             time.sleep(0.4)
-        for process in (self._zoom_process, self._runner_process):
+        for process in (self._zoom_process, self._runner_process, self._finalizer_process):
             if process is not None and process.poll() is None:
                 _terminate_pid(process.pid, force=True)
         for handle in self._log_handles:
@@ -809,6 +878,35 @@ def _runner_enabled() -> bool:
     return _env_bool("LUSH_TELEGRAM_RUNNER_ENABLED", True)
 
 
+def _launcher_uses_finisher() -> bool:
+    explicit = os.getenv("LUSH_LOCAL_FINISHER_ENABLED")
+    if explicit is not None:
+        return _env_bool("LUSH_LOCAL_FINISHER_ENABLED", False)
+    completion_mode = str(os.getenv("DELEGATE_SESSION_COMPLETION_MODE", "inline") or "").strip().lower()
+    return completion_mode == "queued"
+
+
+def _finisher_command() -> list[str]:
+    limit = max(int(os.getenv("LUSH_LOCAL_FINISHER_LIMIT", "1") or 1), 1)
+    poll_seconds = max(float(os.getenv("LUSH_LOCAL_FINISHER_POLL_SECONDS", "5") or 5.0), 0.1)
+    runner_id = os.getenv("LUSH_LOCAL_FINISHER_RUNNER_ID", "launcher-meeting-finisher").strip()
+    if not runner_id:
+        runner_id = "launcher-meeting-finisher"
+    return [
+        sys.executable,
+        "-m",
+        "local_meeting_ai_runtime",
+        "finalizer",
+        "run-loop",
+        "--limit",
+        str(limit),
+        "--poll-seconds",
+        str(poll_seconds),
+        "--runner-id",
+        runner_id,
+    ]
+
+
 def _state_path() -> Path:
     configured = os.getenv("LUSH_LAUNCHER_STATE_PATH", "").strip()
     if configured:
@@ -861,6 +959,76 @@ def _pid_alive(pid: int) -> bool:
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
     return True
+
+
+def _pid_matches_entry(entry_name: str, pid: int, entry: dict[str, Any]) -> bool:
+    if not _pid_alive(pid):
+        return False
+    command = list(entry.get("command") or [])
+    if not command:
+        command = _default_entry_command(entry_name, entry)
+    if not command or os.name != "nt":
+        return True
+    info = _windows_process_info(pid)
+    if not info:
+        return False
+    command_line = str(info.get("command_line") or "").strip().lower()
+    executable_path = str(info.get("executable_path") or "").strip().lower()
+    expected_tokens = [str(item).strip().lower() for item in command if str(item).strip()]
+    if not expected_tokens:
+        return True
+    executable_name = Path(expected_tokens[0]).name.lower()
+    if executable_name and executable_path and Path(executable_path).name.lower() != executable_name:
+        return False
+    for token in expected_tokens[1:]:
+        if token not in command_line:
+            return False
+    return True
+
+
+def _default_entry_command(entry_name: str, entry: dict[str, Any]) -> list[str]:
+    if entry_name == "supervisor":
+        return [sys.executable, "-m", "lush_local_ai_launcher", "_supervise"]
+    if entry_name == "zoom_runtime":
+        return [sys.executable, "-m", "local_meeting_ai_runtime"]
+    if entry_name == "finalizer" and bool(entry.get("enabled", _launcher_uses_finisher())):
+        return _finisher_command()
+    if entry_name == "telegram_runner" and bool(entry.get("enabled", _runner_enabled())):
+        return _runner_command()
+    return []
+
+
+def _windows_process_info(pid: int) -> dict[str, str]:
+    if os.name != "nt" or pid <= 0:
+        return {}
+    script = (
+        f"$proc = Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\"; "
+        "if ($null -eq $proc) { exit 1 }; "
+        "[pscustomobject]@{ExecutablePath=$proc.ExecutablePath; CommandLine=$proc.CommandLine} "
+        "| ConvertTo-Json -Compress"
+    )
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+        **_windows_hidden_process_kwargs(),
+    )
+    if result.returncode != 0:
+        return {}
+    payload = result.stdout.decode(errors="ignore").strip()
+    if not payload:
+        return {}
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        "executable_path": str(parsed.get("ExecutablePath") or ""),
+        "command_line": str(parsed.get("CommandLine") or ""),
+    }
 
 
 def _terminate_pid(pid: int, *, force: bool) -> None:

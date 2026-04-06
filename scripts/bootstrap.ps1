@@ -1,8 +1,15 @@
-param(
+﻿param(
     [switch]$SkipUpgrade
 )
 
 $ErrorActionPreference = "Stop"
+
+$Utf8 = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $Utf8
+[Console]::OutputEncoding = $Utf8
+$OutputEncoding = $Utf8
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $VenvDir = Join-Path $RepoRoot ".venv"
@@ -18,7 +25,7 @@ if (-not (Test-Path $PythonExe)) {
 }
 
 if (-not $SkipUpgrade) {
-    & $PythonExe -m pip install --upgrade pip setuptools wheel
+    & $PythonExe -m pip install --upgrade pip "setuptools<82" wheel
 }
 
 & $PythonExe -m pip install -e $RepoRoot
@@ -26,7 +33,5 @@ if (-not $SkipUpgrade) {
 Write-Host ""
 Write-Host "설치가 끝났습니다."
 Write-Host "다음 예시:"
-Write-Host "  .\\scripts\\zoom-meeting-bot.ps1 setup"
-Write-Host "  .\\scripts\\zoom-meeting-bot.ps1 init --preset launcher_dm"
-Write-Host "  .\\scripts\\zoom-meeting-bot.ps1 configure"
-Write-Host "  .\\scripts\\zoom-meeting-bot.ps1 doctor --mode launcher"
+Write-Host "  .\\scripts\\zoom-meeting-bot.ps1 quickstart --preset launcher_dm --yes"
+Write-Host "  .\\scripts\\zoom-meeting-bot.ps1 create-session \"회의링크\" --passcode \"암호\" --open"

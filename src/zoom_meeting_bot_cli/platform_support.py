@@ -18,6 +18,7 @@ class ToolInstallPlan:
     prompt: str
     command_candidates: tuple[str, ...]
     install_command: tuple[str, ...]
+    reboot_required: bool = False
 
 
 def current_platform_id() -> str:
@@ -57,21 +58,37 @@ def tool_install_plans() -> list[ToolInstallPlan]:
         return [
             ToolInstallPlan(
                 step_name="pandoc",
-                prompt="pandoc가 없으면 PDF/docx 변환 품질이 떨어질 수 있습니다. Homebrew로 설치할까요?",
-                command_candidates=("pandoc",),
+                prompt="Install `pandoc` with Homebrew for docx/PDF export support?",
+                command_candidates=("pandoc", "/opt/homebrew/bin/pandoc", "/usr/local/bin/pandoc"),
                 install_command=("brew", "install", "pandoc"),
             ),
             ToolInstallPlan(
                 step_name="libreoffice",
-                prompt="LibreOffice가 없으면 PDF 변환이 되지 않습니다. Homebrew Cask로 설치할까요?",
+                prompt="Install `LibreOffice` with Homebrew Cask for PDF export support?",
                 command_candidates=("soffice", "/Applications/LibreOffice.app/Contents/MacOS/soffice"),
                 install_command=("brew", "install", "--cask", "libreoffice"),
             ),
             ToolInstallPlan(
                 step_name="ffmpeg",
-                prompt="ffmpeg가 없으면 일부 보조 오디오 처리 경로가 제한될 수 있습니다. Homebrew로 설치할까요?",
-                command_candidates=("ffmpeg",),
+                prompt="Install `ffmpeg` with Homebrew for local audio processing support?",
+                command_candidates=("ffmpeg", "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"),
                 install_command=("brew", "install", "ffmpeg"),
+            ),
+            ToolInstallPlan(
+                step_name="whisper_cpp",
+                prompt="Install `whisper-cpp` with Homebrew so macOS can use the same local fallback ASR path?",
+                command_candidates=("whisper-cli", "/opt/homebrew/bin/whisper-cli", "/usr/local/bin/whisper-cli"),
+                install_command=("brew", "install", "whisper-cpp"),
+            ),
+            ToolInstallPlan(
+                step_name="blackhole_2ch",
+                prompt="Install `BlackHole 2ch` with Homebrew Cask for meeting-output loopback capture?",
+                command_candidates=(
+                    "/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver",
+                    "/Library/Audio/Plug-Ins/HAL/BlackHole16ch.driver",
+                ),
+                install_command=("brew", "install", "--cask", "blackhole-2ch"),
+                reboot_required=True,
             ),
         ]
 
@@ -79,7 +96,7 @@ def tool_install_plans() -> list[ToolInstallPlan]:
         return [
             ToolInstallPlan(
                 step_name="pandoc",
-                prompt="pandoc가 없으면 PDF/docx 변환 품질이 떨어질 수 있습니다. 설치할까요?",
+                prompt="Install `pandoc` for docx/PDF export support?",
                 command_candidates=(
                     "pandoc",
                     r"C:\Users\jung\AppData\Local\Microsoft\WinGet\Packages\JohnMacFarlane.Pandoc_Microsoft.Winget.Source_8wekyb3d8bbwe\pandoc-3.9.0.1\pandoc.exe",
@@ -96,7 +113,7 @@ def tool_install_plans() -> list[ToolInstallPlan]:
             ),
             ToolInstallPlan(
                 step_name="libreoffice",
-                prompt="LibreOffice가 없으면 PDF 변환이 되지 않습니다. 설치할까요?",
+                prompt="Install `LibreOffice` for PDF export support?",
                 command_candidates=("soffice", r"C:\Program Files\LibreOffice\program\soffice.exe"),
                 install_command=(
                     "winget",
@@ -110,7 +127,7 @@ def tool_install_plans() -> list[ToolInstallPlan]:
             ),
             ToolInstallPlan(
                 step_name="ffmpeg",
-                prompt="ffmpeg가 없으면 일부 보조 오디오 처리 경로가 제한될 수 있습니다. 설치할까요?",
+                prompt="Install `ffmpeg` for local audio processing support?",
                 command_candidates=(
                     "ffmpeg",
                     r"C:\Users\jung\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0-full_build\bin\ffmpeg.exe",
@@ -130,19 +147,19 @@ def tool_install_plans() -> list[ToolInstallPlan]:
     return [
         ToolInstallPlan(
             step_name="pandoc",
-            prompt="pandoc가 없으면 PDF/docx 변환 품질이 떨어질 수 있습니다. 설치할까요?",
+            prompt="Install `pandoc` for docx/PDF export support?",
             command_candidates=("pandoc",),
             install_command=(),
         ),
         ToolInstallPlan(
             step_name="libreoffice",
-            prompt="LibreOffice가 없으면 PDF 변환이 되지 않습니다. 설치할까요?",
+            prompt="Install `LibreOffice` for PDF export support?",
             command_candidates=("soffice",),
             install_command=(),
         ),
         ToolInstallPlan(
             step_name="ffmpeg",
-            prompt="ffmpeg가 없으면 일부 보조 오디오 처리 경로가 제한될 수 있습니다. 설치할까요?",
+            prompt="Install `ffmpeg` for local audio processing support?",
             command_candidates=("ffmpeg",),
             install_command=(),
         ),

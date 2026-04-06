@@ -5,6 +5,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$Utf8 = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $Utf8
+[Console]::OutputEncoding = $Utf8
+$OutputEncoding = $Utf8
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $VenvPython = Join-Path $RepoRoot ".venv\\Scripts\\python.exe"
 $PythonExe = if (Test-Path $VenvPython) { $VenvPython } else { "python" }

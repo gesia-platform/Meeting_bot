@@ -10,12 +10,15 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from typing import Any
 import wave
+import gc
 
 import httpx
 
+from .assets import find_whisper_cpp_cli, find_whisper_cpp_model, find_whisper_cpp_vad_model
 from .models import DelegateSession, TranscriptChunk
 
 
@@ -87,6 +90,7 @@ class AiDelegateClient:
         )
         self._local_whisper_best_of = max(self._env_int("DELEGATE_LOCAL_WHISPER_BEST_OF", 5), 1)
         self._local_whisper_beam_size = max(self._env_int("DELEGATE_LOCAL_WHISPER_BEAM_SIZE", 5), 1)
+        self._recording_transcription_providers = self._resolve_recording_transcription_providers()
         self._final_transcribe_model_name = (
             os.getenv("DELEGATE_FINAL_TRANSCRIBE_MODEL", "").strip()
             or os.getenv("DELEGATE_FASTER_WHISPER_MODEL", "").strip()
@@ -105,6 +109,13 @@ class AiDelegateClient:
             os.getenv("DELEGATE_FASTER_WHISPER_FALLBACK_COMPUTE_TYPE", "").strip()
             or "int8_float16"
         )
+        self._faster_whisper_compute_types = self._resolve_faster_whisper_compute_types()
+        if self._faster_whisper_compute_types:
+            self._faster_whisper_compute_type = self._faster_whisper_compute_types[0]
+            self._faster_whisper_fallback_compute_type = (
+                self._faster_whisper_compute_types[1] if len(self._faster_whisper_compute_types) > 1 else ""
+            )
+        self._faster_whisper_cpu_compute_types = self._resolve_faster_whisper_cpu_compute_types()
         self._faster_whisper_beam_size = max(self._env_int("DELEGATE_FASTER_WHISPER_BEAM_SIZE", 5), 1)
         self._faster_whisper_vad_filter = self._env_bool("DELEGATE_FASTER_WHISPER_VAD_FILTER", True)
         self._pyannote_model_name = (
@@ -137,14 +148,68 @@ class AiDelegateClient:
 
     @property
     def can_transcribe_audio(self) -> bool:
-        return bool(self._api_key) or self._whisper_cpp_ready or self._local_whisper_available
+        return any(self._recording_provider_ready(provider) for provider in self._recording_transcription_providers)
+
+    def recording_transcription_strategy(self) -> dict[str, Any]:
+        provider_order = list(self._recording_transcription_providers)
+        ready_providers = [provider for provider in provider_order if self._recording_provider_ready(provider)]
+        blocking_reasons: list[str] = []
+        for provider in provider_order:
+            if self._recording_provider_ready(provider):
+                continue
+            if provider == "whisper_cpp":
+                blocking_reasons.append("whisper.cpp runtime assets are not ready for local capture transcription.")
+            elif provider == "local_whisper":
+                blocking_reasons.append("local whisper is not installed for local capture transcription.")
+            elif provider == "openai":
+                blocking_reasons.append("OpenAI API key is not configured for API capture transcription fallback.")
+        return {
+            "provider_order": provider_order,
+            "ready_providers": ready_providers,
+            "can_transcribe": bool(ready_providers),
+            "prefer_local_transcription": bool(self._prefer_local_transcription),
+            "prefer_whisper_cpp": bool(self._prefer_whisper_cpp),
+            "blocking_reasons": blocking_reasons,
+        }
+
+    def quality_runtime_cache_state(self) -> dict[str, Any]:
+        return {
+            "faster_whisper_compute_types": list(self._faster_whisper_models.keys()),
+            "faster_whisper_model_count": len(self._faster_whisper_models),
+            "pyannote_pipeline_loaded": self._pyannote_pipeline is not None,
+        }
+
+    def release_quality_runtime_resources(self) -> dict[str, Any]:
+        released_compute_types = list(self._faster_whisper_models.keys())
+        released_pyannote = self._pyannote_pipeline is not None
+        self._faster_whisper_models.clear()
+        self._pyannote_pipeline = None
+        gc.collect()
+
+        cuda_cache_cleared = False
+        if importlib.util.find_spec("torch") is not None:
+            try:
+                import torch  # type: ignore[import-not-found]
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    cuda_cache_cleared = True
+            except Exception:
+                cuda_cache_cleared = False
+        return {
+            "released_compute_types": released_compute_types,
+            "released_model_count": len(released_compute_types),
+            "released_pyannote_pipeline": released_pyannote,
+            "cuda_cache_cleared": cuda_cache_cleared,
+        }
 
     def quality_readiness(self) -> dict[str, Any]:
         blocking_reasons: list[str] = []
-        gpu_ready = self._gpu_ready()
+        backend = self._quality_backend(final_pass=True)
+        gpu_ready = bool(backend.get("gpu_ready"))
         faster_whisper_ready = self._faster_whisper_ready
         pyannote_ready = self._pyannote_ready
-        if not gpu_ready:
+        if not backend.get("ready"):
             blocking_reasons.append("CUDA GPU is not available for the final transcription quality pass.")
         if not faster_whisper_ready:
             blocking_reasons.append("faster-whisper is not installed for the final transcription quality pass.")
@@ -152,27 +217,33 @@ class AiDelegateClient:
             blocking_reasons.append("pyannote.audio or Hugging Face token is not ready for diarization.")
         return {
             "gpu_ready": gpu_ready,
+            "backend_device": str(backend.get("device") or ""),
+            "cpu_final_fallback_allowed": bool(backend.get("cpu_final_fallback_allowed")),
             "faster_whisper_ready": faster_whisper_ready,
             "pyannote_ready": pyannote_ready,
-            "provider": "faster_whisper_cuda",
+            "provider": str(backend.get("provider") or "faster_whisper_cuda"),
             "model": self._final_transcribe_model_name,
+            "compute_types": list(backend.get("compute_types") or self._faster_whisper_compute_types),
             "diarization_provider": self._pyannote_model_name,
             "blocking_reasons": blocking_reasons,
         }
 
     def live_transcription_readiness(self) -> dict[str, Any]:
         blocking_reasons: list[str] = []
-        gpu_ready = self._gpu_ready()
+        backend = self._quality_backend(final_pass=False)
+        gpu_ready = bool(backend.get("gpu_ready"))
         faster_whisper_ready = self._faster_whisper_ready
-        if not gpu_ready:
+        if not backend.get("ready"):
             blocking_reasons.append("CUDA GPU is not available for live high-quality transcription.")
         if not faster_whisper_ready:
             blocking_reasons.append("faster-whisper is not installed for live high-quality transcription.")
         return {
             "gpu_ready": gpu_ready,
+            "backend_device": str(backend.get("device") or ""),
             "faster_whisper_ready": faster_whisper_ready,
-            "provider": "faster_whisper_cuda",
+            "provider": str(backend.get("provider") or "faster_whisper_cuda"),
             "model": self._final_transcribe_model_name,
+            "compute_types": list(backend.get("compute_types") or self._faster_whisper_compute_types),
             "blocking_reasons": blocking_reasons,
         }
 
@@ -188,8 +259,9 @@ class AiDelegateClient:
 
         chunks: list[TranscriptChunk] = []
         dropped_segment_count = 0
-        provider = "faster_whisper_cuda"
-        used_compute_type = self._faster_whisper_compute_type
+        provider = str(readiness.get("provider") or "faster_whisper_cuda")
+        compute_types = list(readiness.get("compute_types") or self._faster_whisper_compute_types)
+        used_compute_type = compute_types[0] if compute_types else self._faster_whisper_compute_type
 
         if microphone_path:
             microphone_result = self._transcribe_final_channel_with_faster_whisper(
@@ -198,6 +270,8 @@ class AiDelegateClient:
                 source="microphone_final_offline",
                 channel_origin="local_user",
                 diarization_segments=None,
+                transcription_provider=provider,
+                compute_types=compute_types,
             )
             chunks.extend(microphone_result["chunks"])
             dropped_segment_count += int(microphone_result["dropped_segment_count"])
@@ -211,6 +285,8 @@ class AiDelegateClient:
                 source="meeting_output_final_offline",
                 channel_origin="meeting_output",
                 diarization_segments=diarization_segments,
+                transcription_provider=provider,
+                compute_types=compute_types,
             )
             chunks.extend(meeting_output_result["chunks"])
             dropped_segment_count += int(meeting_output_result["dropped_segment_count"])
@@ -248,17 +324,21 @@ class AiDelegateClient:
             )
 
         chunks: list[TranscriptChunk] = []
-        used_compute_type = self._faster_whisper_compute_type
+        provider = str(readiness.get("provider") or "faster_whisper_cuda")
+        compute_types = list(readiness.get("compute_types") or self._faster_whisper_compute_types)
+        used_compute_type = compute_types[0] if compute_types else self._faster_whisper_compute_type
 
         if microphone_path:
             microphone_result = self._transcribe_channel_with_faster_whisper(
                 Path(microphone_path),
                 fallback_speaker="local_user",
-                source="faster_whisper_cuda",
+                source=provider,
                 channel_origin="local_user",
                 diarization_segments=None,
                 quality_pass="live_high_quality",
                 session_offset_base_seconds=microphone_start_offset_seconds,
+                transcription_provider=provider,
+                compute_types=compute_types,
             )
             chunks.extend(microphone_result["chunks"])
             used_compute_type = str(microphone_result.get("compute_type") or used_compute_type)
@@ -267,11 +347,13 @@ class AiDelegateClient:
             meeting_output_result = self._transcribe_channel_with_faster_whisper(
                 Path(meeting_output_path),
                 fallback_speaker="remote_participant",
-                source="faster_whisper_cuda",
+                source=provider,
                 channel_origin="meeting_output",
                 diarization_segments=None,
                 quality_pass="live_high_quality",
                 session_offset_base_seconds=meeting_output_start_offset_seconds,
+                transcription_provider=provider,
+                compute_types=compute_types,
             )
             chunks.extend(meeting_output_result["chunks"])
             used_compute_type = str(meeting_output_result.get("compute_type") or used_compute_type)
@@ -284,7 +366,7 @@ class AiDelegateClient:
         )
         return {
             "chunks": chunks,
-            "provider": "faster_whisper_cuda",
+            "provider": provider,
             "model": self._final_transcribe_model_name,
             "compute_type": used_compute_type,
             "quality_pass": "live_high_quality",
@@ -301,32 +383,37 @@ class AiDelegateClient:
             raw_suffix = Path(filename).suffix or ".mp4"
             raw_path = temp_path / f"recording{raw_suffix}"
             raw_path.write_bytes(recording_bytes)
-            prepared_path = self._prepare_transcription_input(raw_path)
-            if self._prefer_local_transcription:
-                if self._prefer_whisper_cpp and self._whisper_cpp_ready:
-                    try:
-                        return self._local_transcribe_with_whisper_cpp(prepared_path)
-                    except Exception:
-                        if not self._local_whisper_available and not self._api_key:
-                            raise
-                if self._local_whisper_available:
-                    try:
-                        return self._local_transcribe_with_whisper(prepared_path)
-                    except Exception:
-                        if not self._api_key and not self._whisper_cpp_ready:
-                            raise
-            if self._api_key:
-                payload = await self._openai_transcribe(prepared_path)
-                chunks = self._chunks_from_transcription_payload(payload)
-                if chunks:
-                    return chunks
-                transcript_text = self._extract_transcription_text(payload)
-                return self._text_to_chunks(transcript_text)
-            if self._whisper_cpp_ready:
-                return self._local_transcribe_with_whisper_cpp(prepared_path)
-            if self._local_whisper_available:
-                return self._local_transcribe_with_whisper(prepared_path)
-            raise RuntimeError("No compatible local or API transcription provider is configured.")
+            return await self._transcribe_recording_path(raw_path)
+
+    async def transcribe_recording_path(
+        self,
+        recording_path: str | Path,
+        *,
+        filename: str | None = None,
+    ) -> list[TranscriptChunk]:
+        raw_path = Path(recording_path)
+        if not raw_path.exists():
+            label = str(filename or raw_path.name or raw_path)
+            raise FileNotFoundError(f"Audio recording file was not found for transcription: {label}")
+        return await self._transcribe_recording_path(raw_path)
+
+    async def _transcribe_recording_path(self, raw_path: Path) -> list[TranscriptChunk]:
+        prepared_path = self._prepare_transcription_input(raw_path)
+        last_error: Exception | None = None
+        attempted_providers: list[str] = []
+        for provider in self._recording_transcription_providers:
+            if not self._recording_provider_ready(provider):
+                continue
+            attempted_providers.append(provider)
+            try:
+                return await self._transcribe_recording_with_provider(provider, prepared_path)
+            except Exception as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        if attempted_providers:
+            raise RuntimeError("Configured transcription providers could not transcribe this recording.")
+        raise RuntimeError("No compatible local or API transcription provider is configured for the active provider order.")
 
     def _codex_summarize(self, session: DelegateSession) -> dict[str, Any]:
         request_text = (
@@ -618,12 +705,15 @@ class AiDelegateClient:
         quality_pass: str,
         enable_diarization: bool = False,
     ) -> dict[str, Any]:
-        readiness = self.live_transcription_readiness()
+        is_final_quality_pass = str(quality_pass or "").strip().startswith("final_offline")
+        readiness = self.quality_readiness() if is_final_quality_pass else self.live_transcription_readiness()
         if readiness["blocking_reasons"]:
             raise RuntimeError(" | ".join(str(item) for item in readiness["blocking_reasons"]))
         diarization_segments: list[dict[str, Any]] | None = None
         if enable_diarization and self._pyannote_ready:
             diarization_segments = self._run_pyannote_diarization(Path(input_path))
+        provider = str(readiness.get("provider") or "faster_whisper_cuda")
+        compute_types = list(readiness.get("compute_types") or self._faster_whisper_compute_types)
         result = self._transcribe_channel_with_faster_whisper(
             Path(input_path),
             fallback_speaker=fallback_speaker,
@@ -632,12 +722,14 @@ class AiDelegateClient:
             diarization_segments=diarization_segments,
             quality_pass=quality_pass,
             session_offset_base_seconds=session_offset_base_seconds,
+            transcription_provider=provider,
+            compute_types=compute_types,
         )
         return {
             "chunks": list(result.get("chunks") or []),
-            "provider": "faster_whisper_cuda",
+            "provider": provider,
             "model": self._final_transcribe_model_name,
-            "compute_type": str(result.get("compute_type") or self._faster_whisper_compute_type),
+            "compute_type": str(result.get("compute_type") or (compute_types[0] if compute_types else self._faster_whisper_compute_type)),
             "diarization_provider": self._pyannote_model_name if diarization_segments is not None else None,
             "quality_pass": quality_pass,
             "dropped_segment_count": int(result.get("dropped_segment_count") or 0),
@@ -1022,19 +1114,20 @@ class AiDelegateClient:
         discovered = shutil.which("whisper-cli")
         if discovered:
             return discovered
-        fallback = Path("tools/whisper.cpp/build/bin/Release/whisper-cli.exe")
-        if fallback.exists():
-            return str(fallback.resolve())
+        fallback = find_whisper_cpp_cli()
+        if fallback is not None:
+            return str(fallback)
         return None
 
     def _resolve_whisper_cpp_model(self) -> str | None:
         configured = os.getenv("DELEGATE_WHISPER_CPP_MODEL", "").strip()
         if configured and Path(configured).exists():
             return configured
-        model_name = self._local_whisper_model_name or "base"
-        fallback = Path(f"tools/whisper.cpp/models/ggml-{model_name}.bin")
-        if fallback.exists():
-            return str(fallback.resolve())
+        configured_model_name = self._model_name_from_whisper_cpp_path(configured)
+        model_name = configured_model_name or self._local_whisper_model_name or "base"
+        fallback = find_whisper_cpp_model(model_name)
+        if fallback is not None:
+            return str(fallback)
         return None
 
     @property
@@ -1074,6 +1167,94 @@ class AiDelegateClient:
             return float(raw.strip())
         except ValueError:
             return default
+
+    def _env_csv(self, name: str) -> list[str]:
+        raw = os.getenv(name)
+        if raw is None:
+            return []
+        values: list[str] = []
+        for item in raw.split(","):
+            cleaned = str(item or "").strip()
+            if cleaned:
+                values.append(cleaned)
+        return values
+
+    def _resolve_recording_transcription_providers(self) -> list[str]:
+        configured = [
+            provider
+            for provider in (item.strip().lower() for item in self._env_csv("DELEGATE_RECORDING_TRANSCRIPTION_PROVIDERS"))
+            if provider in {"whisper_cpp", "local_whisper", "openai"}
+        ]
+        providers = configured or self._default_recording_transcription_providers()
+        deduped: list[str] = []
+        for provider in providers:
+            if provider not in deduped:
+                deduped.append(provider)
+        return deduped
+
+    def _default_recording_transcription_providers(self) -> list[str]:
+        providers: list[str] = []
+        if self._prefer_local_transcription:
+            if self._prefer_whisper_cpp:
+                providers.append("whisper_cpp")
+            providers.append("local_whisper")
+            if self._api_key:
+                providers.append("openai")
+            if not self._prefer_whisper_cpp:
+                providers.append("whisper_cpp")
+            return providers
+        if self._api_key:
+            providers.append("openai")
+        providers.extend(["whisper_cpp", "local_whisper"])
+        return providers
+
+    def _resolve_faster_whisper_compute_types(self) -> list[str]:
+        configured = [item.strip() for item in self._env_csv("DELEGATE_FASTER_WHISPER_COMPUTE_TYPES") if item.strip()]
+        providers = configured or [
+            str(self._faster_whisper_compute_type or "").strip(),
+            str(self._faster_whisper_fallback_compute_type or "").strip(),
+        ]
+        deduped: list[str] = []
+        for compute_type in providers:
+            if compute_type and compute_type not in deduped:
+                deduped.append(compute_type)
+        return deduped or ["float16"]
+
+    def _resolve_faster_whisper_cpu_compute_types(self) -> list[str]:
+        configured = [item.strip() for item in self._env_csv("DELEGATE_FASTER_WHISPER_CPU_COMPUTE_TYPES") if item.strip()]
+        providers = configured or ["int8", "float32"]
+        deduped: list[str] = []
+        for compute_type in providers:
+            if compute_type and compute_type not in deduped:
+                deduped.append(compute_type)
+        return deduped or ["int8"]
+
+    def _recording_provider_ready(self, provider: str) -> bool:
+        if provider == "whisper_cpp":
+            return self._whisper_cpp_ready
+        if provider == "local_whisper":
+            return bool(self._local_whisper_available)
+        if provider == "openai":
+            return bool(self._api_key)
+        return False
+
+    async def _transcribe_recording_with_provider(
+        self,
+        provider: str,
+        prepared_path: Path,
+    ) -> list[TranscriptChunk]:
+        if provider == "whisper_cpp":
+            return self._local_transcribe_with_whisper_cpp(prepared_path)
+        if provider == "local_whisper":
+            return self._local_transcribe_with_whisper(prepared_path)
+        if provider == "openai":
+            payload = await self._openai_transcribe(prepared_path)
+            chunks = self._chunks_from_transcription_payload(payload)
+            if chunks:
+                return chunks
+            transcript_text = self._extract_transcription_text(payload)
+            return self._text_to_chunks(transcript_text)
+        raise RuntimeError(f"Unsupported recording transcription provider: {provider}")
 
     def _local_transcribe_with_whisper(self, input_path: Path) -> list[TranscriptChunk]:
         whisper = self._load_whisper_module()
@@ -1322,30 +1503,16 @@ class AiDelegateClient:
         configured = os.getenv("DELEGATE_WHISPER_CPP_VAD_MODEL", "").strip()
         if configured and Path(configured).exists():
             return configured
+        fallback = find_whisper_cpp_vad_model(preferred_model_path=self._whisper_cpp_model_path)
+        if fallback is not None:
+            return str(fallback)
+        return None
 
-        candidate_roots: list[Path] = []
-        configured_model = Path(str(self._whisper_cpp_model_path or "")).expanduser()
-        if configured_model.exists():
-            candidate_roots.append(configured_model.parent)
-        candidate_roots.append(Path("tools/whisper.cpp/models"))
-
-        matches: list[Path] = []
-        for root in candidate_roots:
-            if not root.exists():
-                continue
-            for pattern in ("ggml-silero-v*.bin", "silero-v*-ggml.bin", "for-tests-silero-v*-ggml.bin"):
-                matches.extend(root.glob(pattern))
-
-        if not matches:
-            return None
-        matches.sort(
-            key=lambda path: (
-                1 if "for-tests" in path.name.lower() else 0,
-                -path.stat().st_size if path.exists() else 0,
-                path.name.lower(),
-            )
-        )
-        return str(matches[0].resolve())
+    def _model_name_from_whisper_cpp_path(self, configured_path: str) -> str:
+        name = Path(str(configured_path or "").strip()).name
+        if name.startswith("ggml-") and name.endswith(".bin"):
+            return name[len("ggml-") : -len(".bin")].strip()
+        return ""
 
     @property
     def _faster_whisper_ready(self) -> bool:
@@ -1370,6 +1537,41 @@ class AiDelegateClient:
             return bool(torch.cuda.is_available())
         except Exception:
             return False
+
+    def _platform_supports_cpu_final_transcription(self) -> bool:
+        if self._env_bool("DELEGATE_ALLOW_CPU_FINAL_TRANSCRIPTION", False):
+            return True
+        return sys.platform == "darwin"
+
+    def _quality_backend(self, *, final_pass: bool) -> dict[str, Any]:
+        gpu_ready = self._gpu_ready()
+        cpu_final_fallback_allowed = bool(final_pass and self._platform_supports_cpu_final_transcription())
+        if gpu_ready:
+            return {
+                "ready": True,
+                "gpu_ready": True,
+                "device": "cuda",
+                "provider": "faster_whisper_cuda",
+                "compute_types": list(self._faster_whisper_compute_types),
+                "cpu_final_fallback_allowed": cpu_final_fallback_allowed,
+            }
+        if cpu_final_fallback_allowed:
+            return {
+                "ready": True,
+                "gpu_ready": False,
+                "device": "cpu",
+                "provider": "faster_whisper_cpu",
+                "compute_types": list(self._faster_whisper_cpu_compute_types),
+                "cpu_final_fallback_allowed": True,
+            }
+        return {
+            "ready": False,
+            "gpu_ready": False,
+            "device": "",
+            "provider": "faster_whisper_cuda",
+            "compute_types": list(self._faster_whisper_compute_types),
+            "cpu_final_fallback_allowed": cpu_final_fallback_allowed,
+        }
 
     def _load_faster_whisper_model(self, compute_type: str) -> Any:
         if compute_type not in self._faster_whisper_models:
@@ -1450,6 +1652,8 @@ class AiDelegateClient:
         source: str,
         channel_origin: str,
         diarization_segments: list[dict[str, Any]] | None,
+        transcription_provider: str,
+        compute_types: list[str] | None = None,
     ) -> dict[str, Any]:
         return self._transcribe_channel_with_faster_whisper(
             input_path,
@@ -1459,6 +1663,8 @@ class AiDelegateClient:
             diarization_segments=diarization_segments,
             quality_pass="final_offline",
             session_offset_base_seconds=0.0,
+            transcription_provider=transcription_provider,
+            compute_types=compute_types,
         )
 
     def _transcribe_channel_with_faster_whisper(
@@ -1471,10 +1677,10 @@ class AiDelegateClient:
         diarization_segments: list[dict[str, Any]] | None,
         quality_pass: str,
         session_offset_base_seconds: float | None,
+        transcription_provider: str,
+        compute_types: list[str] | None = None,
     ) -> dict[str, Any]:
-        attempts = [self._faster_whisper_compute_type]
-        if self._faster_whisper_fallback_compute_type and self._faster_whisper_fallback_compute_type not in attempts:
-            attempts.append(self._faster_whisper_fallback_compute_type)
+        attempts = list(compute_types or self._faster_whisper_compute_types)
         last_error = "faster-whisper transcription failed."
         dropped_segment_count = 0
         base_offset = max(float(session_offset_base_seconds or 0.0), 0.0)
@@ -1506,7 +1712,7 @@ class AiDelegateClient:
                         "session_end_offset_seconds": round(base_offset + end, 3),
                         "channel_origin": channel_origin,
                         "audio_source": "microphone" if channel_origin == "local_user" else "system",
-                        "transcription_provider": "faster_whisper_cuda",
+                        "transcription_provider": transcription_provider,
                         "diarization_provider": self._pyannote_model_name if diarization_segments is not None else None,
                         "quality_pass": quality_pass,
                         "avg_logprob": self._round_optional(getattr(segment, "avg_logprob", None), 4),

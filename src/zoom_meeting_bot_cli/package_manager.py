@@ -60,7 +60,7 @@ def _iter_bundle_files(root: Path, *, include_notes: bool) -> list[Path]:
         if path.exists():
             files.append(path)
 
-    for relative_dir in ("scripts", "schemas", "src", "doc"):
+    for relative_dir in ("scripts", "schemas", "src", "doc", "tools"):
         directory = root / relative_dir
         if directory.exists():
             files.extend(_walk_files(directory))

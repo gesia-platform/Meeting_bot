@@ -54,12 +54,13 @@ Zoom 회의 엔진 + 결과물 전달 계층까지 같이 돌립니다.
 
 사용자는 Windows든 macOS든 같은 CLI 명령을 씁니다.
 
-- `zoom-meeting-bot setup`
-- `zoom-meeting-bot init`
-- `zoom-meeting-bot configure`
-- `zoom-meeting-bot doctor`
-- `zoom-meeting-bot start`
-- `zoom-meeting-bot create-session`
+- `quickstart`
+- `create-session`
+- `status`
+- `stop`
+
+예시를 그대로 따라칠 때는 `.\scripts\zoom-meeting-bot.ps1` 또는 `./scripts/zoom-meeting-bot.sh`를 쓰는 쪽을 기본으로 보시면 됩니다.
+bare `zoom-meeting-bot` 명령은 `.venv`를 활성화했을 때만 바로 동작할 수 있습니다.
 
 차이는 내부에서만 처리합니다.
 
@@ -82,21 +83,25 @@ Zoom 회의 엔진 + 결과물 전달 계층까지 같이 돌립니다.
 
 ```powershell
 .\scripts\bootstrap.ps1
-.\scripts\zoom-meeting-bot.ps1 setup
-.\scripts\zoom-meeting-bot.ps1 init --preset launcher_dm
-.\scripts\zoom-meeting-bot.ps1 configure
-.\scripts\zoom-meeting-bot.ps1 doctor --mode launcher
+.\scripts\zoom-meeting-bot.ps1 quickstart --preset launcher_dm --yes
+.\scripts\zoom-meeting-bot.ps1 create-session "회의링크" --passcode "암호" --open
 ```
 
 ### macOS
 
 ```bash
 ./scripts/bootstrap.sh
-./scripts/zoom-meeting-bot.sh setup
-./scripts/zoom-meeting-bot.sh init --preset launcher_dm
-./scripts/zoom-meeting-bot.sh configure
-./scripts/zoom-meeting-bot.sh doctor --mode launcher
+./scripts/zoom-meeting-bot.sh quickstart --preset launcher_dm --yes
+./scripts/zoom-meeting-bot.sh create-session "회의링크" --passcode "암호" --open
 ```
+
+macOS first-run notes:
+
+- `bootstrap.sh` assumes `python3` is available.
+- `bootstrap.sh` installs Homebrew automatically when it is missing.
+- `quickstart` installs `pandoc`, `LibreOffice`, `ffmpeg`, `whisper-cpp`, and `BlackHole 2ch` when they are missing, and it also downloads the bundled default `whisper.cpp` model automatically if the repository does not already contain it.
+- If `BlackHole 2ch` is installed for the first time, macOS may require one reboot before meeting-output capture becomes available.
+- If CUDA is unavailable on macOS, the final offline transcription path uses the local CPU `faster-whisper` backend instead of dropping straight to live-only quality.
 
 위 흐름의 뜻은 이렇습니다.
 
@@ -154,7 +159,7 @@ Zoom 회의 엔진 + 결과물 전달 계층까지 같이 돌립니다.
 
 ## configure에서 무엇을 넣나
 
-`zoom-meeting-bot configure`는 대체로 아래 순서로 묻습니다.
+`configure` 단계는 대체로 아래 순서로 묻습니다.
 
 ### 1. 기본 프로필
 
@@ -237,7 +242,7 @@ Telegram을 켜면 아래를 입력합니다.
 
 ## setup은 무엇을 설치하나
 
-`zoom-meeting-bot setup`은 아래를 순서대로 묻고 진행합니다.
+`setup` 단계는 아래를 순서대로 묻고 진행합니다.
 
 ### 기본 디렉터리
 
@@ -258,6 +263,12 @@ Telegram을 켜면 아래를 입력합니다.
 - `LibreOffice`
 - `ffmpeg`
 
+### macOS additional prerequisites
+
+- `python3`
+- macOS Microphone and Screen Recording permissions
+- If `BlackHole 2ch` is installed during `quickstart`, reboot macOS once before the first real meeting capture
+
 ### 모델 준비
 
 - 전사 모델
@@ -269,7 +280,7 @@ Telegram을 켜면 아래를 입력합니다.
 
 ## doctor는 무엇을 보나
 
-`zoom-meeting-bot doctor`는 아래를 봅니다.
+`doctor` 단계는 아래를 봅니다.
 
 - 설정 파일이 있는지
 - Zoom Client ID/Secret이 있는지
@@ -283,9 +294,11 @@ Telegram을 켜면 아래를 입력합니다.
 추천은:
 
 - `runtime_only`로 시작하면:
-  `zoom-meeting-bot doctor --mode runtime_only`
+  - Windows: `.\scripts\zoom-meeting-bot.ps1 doctor --mode runtime_only`
+  - macOS: `./scripts/zoom-meeting-bot.sh doctor --mode runtime_only`
 - `launcher`로 시작하면:
-  `zoom-meeting-bot doctor --mode launcher`
+  - Windows: `.\scripts\zoom-meeting-bot.ps1 doctor --mode launcher`
+  - macOS: `./scripts/zoom-meeting-bot.sh doctor --mode launcher`
 
 `Doctor finished with no blocking problems.`가 보일 때까지 정리하고 다음 단계로 가는 게 좋습니다.
 
@@ -296,11 +309,8 @@ Telegram을 켜면 아래를 입력합니다.
 ### A. PDF까지만 먼저 보고 싶을 때
 
 ```powershell
-zoom-meeting-bot init --preset runtime_only
-zoom-meeting-bot configure
-zoom-meeting-bot doctor --mode runtime_only
-zoom-meeting-bot start
-zoom-meeting-bot create-session "https://us06web.zoom.us/j/..." --passcode "123456" --open
+.\scripts\zoom-meeting-bot.ps1 quickstart --preset runtime_only --yes
+.\scripts\zoom-meeting-bot.ps1 create-session "https://us06web.zoom.us/j/..." --passcode "123456" --open
 ```
 
 회의 종료 후:
@@ -314,11 +324,8 @@ zoom-meeting-bot create-session "https://us06web.zoom.us/j/..." --passcode "1234
 ### B. PDF를 개인 1:1 DM으로도 받고 싶을 때
 
 ```powershell
-zoom-meeting-bot init --preset launcher_dm
-zoom-meeting-bot configure
-zoom-meeting-bot doctor --mode launcher
-zoom-meeting-bot start
-zoom-meeting-bot create-session "https://us06web.zoom.us/j/..." --passcode "123456" --open
+.\scripts\zoom-meeting-bot.ps1 quickstart --preset launcher_dm --yes
+.\scripts\zoom-meeting-bot.ps1 create-session "https://us06web.zoom.us/j/..." --passcode "123456" --open
 ```
 
 회의 종료 후:
@@ -335,7 +342,7 @@ zoom-meeting-bot create-session "https://us06web.zoom.us/j/..." --passcode "1234
 ### 세션 생성
 
 ```powershell
-zoom-meeting-bot create-session "회의링크" --passcode "암호" --open
+.\scripts\zoom-meeting-bot.ps1 create-session "회의링크" --passcode "암호" --open
 ```
 
 이 명령은:
@@ -347,19 +354,19 @@ zoom-meeting-bot create-session "회의링크" --passcode "암호" --open
 ### 세션 목록 보기
 
 ```powershell
-zoom-meeting-bot list-sessions
+.\scripts\zoom-meeting-bot.ps1 list-sessions
 ```
 
 ### 세션 상세 보기
 
 ```powershell
-zoom-meeting-bot show-session <session_id>
+.\scripts\zoom-meeting-bot.ps1 show-session <session_id>
 ```
 
 ### 세션 페이지 열기
 
 ```powershell
-zoom-meeting-bot open-session <session_id>
+.\scripts\zoom-meeting-bot.ps1 open-session <session_id>
 ```
 
 ---
@@ -396,15 +403,9 @@ zoom-meeting-bot open-session <session_id>
 
 ## 완전 처음 받는 사람을 위한 추천 순서
 
-진짜 생 백지에서 시작한다면 아래 순서만 기억하면 됩니다.
+진짜 처음 받는 분은 아래 3단계만 먼저 따라가시면 됩니다.
 
-### 1. 저장소 받기
-
-- GitHub clone
-  또는
-- zip 다운로드 후 압축 해제
-
-### 2. 부트스트랩
+### 1. 부트스트랩
 
 Windows:
 
@@ -418,49 +419,69 @@ macOS:
 ./scripts/bootstrap.sh
 ```
 
-### 3. 설치
+이 단계는 `.venv`와 CLI 실행 기반을 준비하는 단계입니다.
+
+### 2. 처음 준비 한 번에 끝내기
+
+개인 Telegram DM까지 받아보는 기본 경로는 아래 한 줄입니다.
 
 ```powershell
-zoom-meeting-bot setup
+.\scripts\zoom-meeting-bot.ps1 quickstart --preset launcher_dm --yes
 ```
 
-### 4. 첫 설정 파일 만들기
+macOS parity notes:
 
-PDF를 개인 DM까지 받고 싶으면:
+- macOS uses the same `quickstart -> doctor -> start` flow via `./scripts/zoom-meeting-bot.sh quickstart --preset launcher_dm --yes`.
+- If bundled `whisper.cpp` does not already contain a macOS CLI, `setup` first tries a Homebrew `whisper-cpp` install and only builds `tools/whisper.cpp/build-macos` as a last resort.
+- If CUDA is unavailable on macOS, final offline transcription uses the local CPU `faster-whisper` path.
+
+이 명령은 아래를 한 번에 처리합니다.
+
+- `init`
+- `configure`
+- `setup`
+- `doctor`
+- `start`
+
+- `setup` tries the bundled `tools/whisper.cpp` assets first. If the default `ggml-large-v3-turbo-q5_0.bin` model is missing, it downloads it with the upstream `whisper.cpp` script, then on macOS it tries a Homebrew `whisper-cpp` install and only falls back to a local `build-macos` build when necessary.
+
+설명:
+
+- `launcher_dm`은 회의 종료 후 PDF를 개인 Telegram DM으로 받는 기본 preset입니다.
+- `--yes`는 설치/준비 단계에서 추천 선택지를 자동으로 받습니다.
+- Windows에서 NVIDIA GPU가 감지되면 `setup`이 CUDA용 `torch`/`torchaudio`도 자동으로 맞춰서 final transcription 품질 경로를 살리려 시도합니다.
+- PDF까지만 먼저 보고 싶으면 아래처럼 `runtime_only`를 쓰시면 됩니다.
 
 ```powershell
-zoom-meeting-bot init --preset launcher_dm
+.\scripts\zoom-meeting-bot.ps1 quickstart --preset runtime_only --yes
 ```
 
-### 5. 사용자 값 넣기
+### 3. 회의 세션 만들기
 
 ```powershell
-zoom-meeting-bot configure
+.\scripts\zoom-meeting-bot.ps1 create-session "회의링크" --passcode "암호" --open
 ```
 
-### 6. 준비 상태 점검
+이 명령은 회의 세션을 만들고, 런타임이 아직 안 떠 있으면 자동으로 시작한 뒤 회의 진입 페이지까지 엽니다.
 
-```powershell
-zoom-meeting-bot doctor --mode launcher
-```
-
-### 7. 실행
-
-```powershell
-zoom-meeting-bot start
-zoom-meeting-bot status
-```
-
-### 8. 회의 세션 생성
-
-```powershell
-zoom-meeting-bot create-session "회의링크" --passcode "암호" --open
-```
-
-### 9. 회의 종료 후 결과 확인
+### 회의가 끝나면 확인할 것
 
 - `data/exports/<session_id>/...pdf`
-- Telegram DM 또는 route 대상
+- preset과 route 설정에 따라 Telegram DM 또는 지정 route 전달
+
+### 세부 단계를 직접 나눠서 하고 싶다면
+
+아래 저수준 명령도 그대로 사용할 수 있습니다.
+
+```powershell
+.\scripts\zoom-meeting-bot.ps1 setup
+.\scripts\zoom-meeting-bot.ps1 init --preset launcher_dm
+.\scripts\zoom-meeting-bot.ps1 configure
+.\scripts\zoom-meeting-bot.ps1 doctor --mode launcher
+.\scripts\zoom-meeting-bot.ps1 start
+.\scripts\zoom-meeting-bot.ps1 status
+.\scripts\zoom-meeting-bot.ps1 create-session "회의링크" --passcode "암호" --open
+```
 
 ---
 
@@ -469,25 +490,25 @@ zoom-meeting-bot create-session "회의링크" --passcode "암호" --open
 ### 1. 설정이 맞는지
 
 ```powershell
-zoom-meeting-bot show-config
+.\scripts\zoom-meeting-bot.ps1 show-config
 ```
 
 ### 2. 준비 상태가 맞는지
 
 ```powershell
-zoom-meeting-bot doctor --mode launcher
+.\scripts\zoom-meeting-bot.ps1 doctor --mode launcher
 ```
 
 ### 3. 런타임이 살아 있는지
 
 ```powershell
-zoom-meeting-bot status
+.\scripts\zoom-meeting-bot.ps1 status
 ```
 
 ### 4. 진단 번들 만들기
 
 ```powershell
-zoom-meeting-bot support-bundle
+.\scripts\zoom-meeting-bot.ps1 support-bundle
 ```
 
 이 JSON을 주면 다른 사람 PC 문제를 보기 훨씬 쉬워집니다.

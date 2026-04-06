@@ -6,6 +6,7 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
@@ -74,12 +75,14 @@ class LocalObserver:
         return self._meeting_output_device_name
 
     def audio_quality_readiness(self) -> dict[str, Any]:
+        quality_notes: list[str] = []
         if importlib.util.find_spec("soundcard") is None:
             return {
                 "microphone_device_ready": False,
                 "meeting_output_device_ready": False,
                 "configured_meeting_output_device": self._meeting_output_device_name or None,
                 "blocking_reasons": ["soundcard dependency is not installed."],
+                "quality_notes": quality_notes,
             }
         try:
             soundcard = self._import_module("soundcard")
@@ -91,6 +94,7 @@ class LocalObserver:
                 "meeting_output_device_ready": False,
                 "configured_meeting_output_device": self._meeting_output_device_name or None,
                 "blocking_reasons": [str(exc)],
+                "quality_notes": quality_notes,
             }
         microphone_device_ready = bool(
             self._match_named_device(microphones, self._microphone_device_name)
@@ -110,11 +114,23 @@ class LocalObserver:
             blocking_reasons.append(
                 f"Configured meeting output device was not found: {self._meeting_output_device_name}"
             )
+        if sys.platform == "darwin":
+            known_loopback_markers = ("blackhole", "loopback", "soundflower", "aggregate", "multi-output")
+            normalized_device = str(self._meeting_output_device_name or "").strip().lower()
+            if normalized_device and not any(marker in normalized_device for marker in known_loopback_markers):
+                quality_notes.append(
+                    "macOS meeting output device does not look like a known loopback device. "
+                    "BlackHole, Loopback, Soundflower, or an aggregate/multi-output device is recommended."
+                )
+            quality_notes.append(
+                "macOS requires Microphone and Screen Recording permissions for stable local observation."
+            )
         return {
             "microphone_device_ready": microphone_device_ready,
             "meeting_output_device_ready": meeting_output_device_ready,
             "configured_meeting_output_device": self._meeting_output_device_name or None,
             "blocking_reasons": blocking_reasons,
+            "quality_notes": quality_notes,
         }
 
     def microphone_device_available(self, device_name: str | None = None) -> bool:

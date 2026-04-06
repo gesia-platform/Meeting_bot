@@ -19,8 +19,8 @@
     "meeting_output_device": "Realtek HD Audio 2nd output(Realtek(R) Audio)",
     "pandoc_command": "pandoc",
     "libreoffice_command": "soffice",
-    "whisper_cpp_command": "",
-    "whisper_cpp_model": ""
+    "whisper_cpp_command": "tools/whisper.cpp/build/bin/Release/whisper-cli.exe",
+    "whisper_cpp_model": "tools/whisper.cpp/models/ggml-large-v3-turbo-q5_0.bin"
   },
   "telegram": {
     "enabled": true,
@@ -41,6 +41,7 @@
   },
   "runtime": {
     "execution_mode": "launcher",
+    "completion_mode": "queued",
     "host": "127.0.0.1",
     "port": 8787,
     "audio_mode": "conversation",

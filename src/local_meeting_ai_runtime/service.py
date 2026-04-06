@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import threading
 from typing import Any
 from uuid import uuid4
@@ -24,11 +25,12 @@ from .models import (
     ChatTurn,
     DelegateSession,
     MeetingInput,
+    RunnerJob,
     TranscriptChunk,
     WorkspaceEvent,
     utcnow_iso,
 )
-from .storage import SessionStore
+from .storage import RunnerQueueStore, SessionStore
 from .summary_pipeline import DelegateSummaryPipeline
 from .zoom_client import ZoomRestClient, ZoomRuntimeError
 
@@ -48,8 +50,12 @@ class DelegateService:
         summary_pipeline: DelegateSummaryPipeline | None = None,
         artifact_exporter: MeetingArtifactExporter | None = None,
         export_dir: str | Path | None = None,
+        runner_store: RunnerQueueStore | None = None,
     ) -> None:
         self._store = store
+        self._runner_store = runner_store or RunnerQueueStore(
+            path=os.getenv("DELEGATE_RUNNER_QUEUE_PATH", "data/runner_queue.json")
+        )
         self._zoom = zoom_client
         self._ai = ai_client
         self._meeting = meeting_adapter
@@ -60,6 +66,9 @@ class DelegateService:
         self._export_dir.mkdir(parents=True, exist_ok=True)
         self._audio_archive_dir = Path(os.getenv("DELEGATE_AUDIO_ARCHIVE_DIR", "data/audio"))
         self._audio_archive_dir.mkdir(parents=True, exist_ok=True)
+        self._auto_cleanup_enabled = self._env_bool("DELEGATE_AUTO_CLEANUP_ENABLED", True)
+        self._audio_keep_session_count = max(self._env_int("DELEGATE_AUDIO_KEEP_SESSION_COUNT", 25), 0)
+        self._observer_tmp_retention_hours = max(self._env_int("DELEGATE_OBSERVER_TMP_RETENTION_HOURS", 6), 0)
         self._audio_observer_tasks: dict[str, asyncio.Task[None]] = {}
         self._audio_observer_controls: dict[str, dict[str, Any]] = {}
         self._completion_locks: dict[str, asyncio.Lock] = {}
@@ -105,6 +114,8 @@ class DelegateService:
             self._env_float("DELEGATE_SESSION_WATCHDOG_POLL_SECONDS", 5.0),
             1.0,
         )
+        if self._auto_cleanup_enabled:
+            self._run_storage_housekeeping()
 
     async def create_session(self, payload: dict[str, Any], *, base_url: str | None = None) -> DelegateSession:
         meeting_payload: dict[str, Any] = {}
@@ -475,7 +486,10 @@ class DelegateService:
             )
         session = self.persist_session(session)
         if saw_meeting_closed:
-            session = await self.complete_session(session_id)
+            session, _completion = await self.request_session_completion(
+                session_id,
+                requested_by="meeting_state_closed",
+            )
         return session, {
             "processed_count": len(processed),
             "processed": processed,
@@ -571,6 +585,7 @@ class DelegateService:
 
         observations: list[dict[str, Any]] = []
         captured_chunks: list[TranscriptChunk] = []
+        archive_state_changed = False
         capture_tasks = []
         for source_name in source_order:
             capture_kwargs: dict[str, Any] = {
@@ -603,14 +618,14 @@ class DelegateService:
             observation = dict(capture_result)
             archived_path = self._archive_audio_observation(session, observation)
             observation["archived_path"] = archived_path
+            if archived_path:
+                archive_state_changed = True
+            observation.pop("audio_bytes", None)
             observations.append(observation)
             if observation.get("below_rms_threshold"):
                 continue
 
-            chunks = await self._ai.transcribe_recording_bytes(
-                observation["audio_bytes"],
-                filename=str(observation.get("filename") or "audio-capture.wav"),
-            )
+            chunks = await self._transcribe_audio_observation(observation)
             if not chunks:
                 continue
 
@@ -651,6 +666,9 @@ class DelegateService:
             captured_chunks.extend(merged_chunks)
 
         captured_chunks = self._dedupe_audio_chunks(captured_chunks)
+        if archive_state_changed:
+            # Persist archive metadata before ingest_inputs() reloads the session from storage.
+            session = self.persist_session(session)
         all_inputs = [
             {
                 "input_type": "spoken_transcript",
@@ -1257,6 +1275,8 @@ class DelegateService:
         microphone_observation["archived_path"] = microphone_archived_path
         system_archived_path = self._archive_audio_observation(session, system_observation)
         system_observation["archived_path"] = system_archived_path
+        microphone_observation.pop("audio_bytes", None)
+        system_observation.pop("audio_bytes", None)
         duplex_observation = self._build_duplex_audio_observation(
             microphone_observation,
             system_observation,
@@ -1280,6 +1300,9 @@ class DelegateService:
 
         archived_path = self._archive_audio_observation(session, duplex_observation)
         duplex_observation["archived_path"] = archived_path
+        if microphone_archived_path or system_archived_path or archived_path:
+            # Persist archive metadata before any early return or ingest_inputs() store reload.
+            session = self.persist_session(session)
         if duplex_observation.get("below_rms_threshold"):
             return session, {
                 "capture_mode": "conversation",
@@ -1437,95 +1460,289 @@ class DelegateService:
             except Exception as exc:
                 duplex_observation["live_transcription_error"] = str(exc).strip() or exc.__class__.__name__
 
-        return await self._ai.transcribe_recording_bytes(
-            duplex_observation["audio_bytes"],
-            filename=str(duplex_observation.get("filename") or "conversation-capture.wav"),
-        )
+        return await self._transcribe_audio_observation(duplex_observation)
 
     async def complete_session(self, session_id: str) -> DelegateSession:
         lock = self._completion_locks.setdefault(session_id, asyncio.Lock())
         async with lock:
-            session = self._require_session(session_id)
-            if session.status == "completed":
-                return session
-            await self.stop_audio_observer(session_id)
-            session = self._require_session(session_id)
-            latest_archive_at = self._latest_audio_archive_at(session)
-            final_transcription_state = dict(session.ai_state.get("final_transcription") or {})
-            final_audio_at = str(final_transcription_state.get("quality_pass_at") or "").strip()
-            last_summary_at = str(session.ai_state.get("last_summary_at") or "").strip()
-            summary_is_current = bool(
-                session.status == "completed"
-                and session.summary
-                and session.summary_exports
-                and str(final_transcription_state.get("status") or "").strip() == "success"
-                and (
-                    not latest_archive_at
-                    or (
-                        (not final_audio_at or latest_archive_at <= final_audio_at)
-                        and (not last_summary_at or latest_archive_at <= last_summary_at)
-                    )
+            try:
+                return await self._complete_session_locked(session_id)
+            finally:
+                self._ai.release_quality_runtime_resources()
+
+    async def _complete_session_locked(self, session_id: str) -> DelegateSession:
+        session = self._require_session(session_id)
+        if session.status == "completed":
+            return session
+        await self.stop_audio_observer(session_id)
+        session = self._require_session(session_id)
+        latest_archive_at = self._latest_audio_archive_at(session)
+        final_transcription_state = dict(session.ai_state.get("final_transcription") or {})
+        final_audio_at = str(final_transcription_state.get("quality_pass_at") or "").strip()
+        last_summary_at = str(session.ai_state.get("last_summary_at") or "").strip()
+        summary_is_current = bool(
+            session.status == "completed"
+            and session.summary
+            and session.summary_exports
+            and str(final_transcription_state.get("status") or "").strip() == "success"
+            and (
+                not latest_archive_at
+                or (
+                    (not final_audio_at or latest_archive_at <= final_audio_at)
+                    and (not last_summary_at or latest_archive_at <= last_summary_at)
                 )
             )
-            if summary_is_current:
-                return session
+        )
+        if summary_is_current:
+            return session
 
-            if latest_archive_at:
-                try:
-                    session = await self._refresh_transcript_from_audio_archive(session)
-                except Exception as exc:
-                    failure_reason = str(exc).strip() or "Final transcription quality pass failed."
-                    session.ai_state["final_transcription"] = {
-                        "status": "failed",
-                        "provider": "faster_whisper_cuda",
-                        "model": self._ai.quality_readiness().get("model"),
-                        "diarization_provider": self._ai.quality_readiness().get("diarization_provider"),
-                        "quality_pass_at": utcnow_iso(),
-                        "dropped_segment_count": 0,
-                        "archive_gap_count": 0,
-                        "readiness_snapshot": self.quality_readiness(),
-                        "failure_reason": failure_reason,
-                    }
-                    if not (session.transcript or session.chat_history or session.input_timeline):
-                        session.status = "completed"
-                        session.status_reason = failure_reason
-                        session.summary = None
-                        session.action_items = []
-                        session.summary_exports = []
-                        session.transcript_exports = []
-                        return self.persist_session(session)
-                    session.status_reason = (
-                        "Final offline transcription failed, so the exported summary used the current live meeting capture. "
-                        + failure_reason
-                    )
-            else:
+        if latest_archive_at:
+            try:
+                session = await self._refresh_transcript_from_audio_archive(session)
+            except Exception as exc:
+                failure_reason = str(exc).strip() or "Final transcription quality pass failed."
                 session.ai_state["final_transcription"] = {
-                    "status": "skipped",
-                    "provider": None,
-                    "model": None,
-                    "diarization_provider": None,
+                    "status": "failed",
+                    "provider": str(self._ai.quality_readiness().get("provider") or "faster_whisper_cuda"),
+                    "model": self._ai.quality_readiness().get("model"),
+                    "diarization_provider": self._ai.quality_readiness().get("diarization_provider"),
                     "quality_pass_at": utcnow_iso(),
                     "dropped_segment_count": 0,
                     "archive_gap_count": 0,
                     "readiness_snapshot": self.quality_readiness(),
-                    "reason": "No archived audio was captured for this session.",
+                    "failure_reason": failure_reason,
                 }
+                if not (session.transcript or session.chat_history or session.input_timeline):
+                    session.status = "completed"
+                    session.status_reason = failure_reason
+                    session.summary = None
+                    session.action_items = []
+                    session.summary_exports = []
+                    session.transcript_exports = []
+                    return self.persist_session(session)
+                session.status_reason = (
+                    "Final offline transcription failed, so the exported summary used the current live meeting capture. "
+                    + failure_reason
+                )
+        else:
+            session.ai_state["final_transcription"] = {
+                "status": "skipped",
+                "provider": None,
+                "model": None,
+                "diarization_provider": None,
+                "quality_pass_at": utcnow_iso(),
+                "dropped_segment_count": 0,
+                "archive_gap_count": 0,
+                "readiness_snapshot": self.quality_readiness(),
+                "reason": "No archived audio was captured for this session.",
+            }
 
-            session.status = "completed"
-            if str(session.ai_state.get("final_transcription", {}).get("status") or "").strip().lower() == "success":
-                session.status_reason = None
-            session.summary_packet = self._summary_pipeline.build(session)
-            ai_result = await self._ai.summarize_session(session)
-            session.summary = str(ai_result.get("summary") or "").strip()
-            session.action_items = [str(item).strip() for item in ai_result.get("action_items", []) if str(item).strip()]
-            self._apply_ai_summary_intelligence(session, ai_result)
-            if ai_result.get("response_id"):
-                session.ai_state["last_model_response_id"] = str(ai_result["response_id"])
-            if ai_result.get("provider"):
-                session.ai_state["last_provider"] = str(ai_result["provider"])
-            session.ai_state["last_summary_at"] = utcnow_iso()
-            self._write_exports(session)
-            return self.persist_session(session)
+        session.status = "completed"
+        if str(session.ai_state.get("final_transcription", {}).get("status") or "").strip().lower() == "success":
+            session.status_reason = None
+        session.summary_packet = self._summary_pipeline.build(session)
+        ai_result = await self._ai.summarize_session(session)
+        session.summary = str(ai_result.get("summary") or "").strip()
+        session.action_items = [str(item).strip() for item in ai_result.get("action_items", []) if str(item).strip()]
+        self._apply_ai_summary_intelligence(session, ai_result)
+        if ai_result.get("response_id"):
+            session.ai_state["last_model_response_id"] = str(ai_result["response_id"])
+        if ai_result.get("provider"):
+            session.ai_state["last_provider"] = str(ai_result["provider"])
+        session.ai_state["last_summary_at"] = utcnow_iso()
+        self._write_exports(session)
+        return self.persist_session(session)
+
+    async def request_session_completion(
+        self,
+        session_id: str,
+        *,
+        mode: str | None = None,
+        requested_by: str = "api",
+    ) -> tuple[DelegateSession, dict[str, Any]]:
+        completion_mode = self._resolve_completion_mode(mode)
+        await self.stop_audio_observer(session_id)
+        session = self._require_session(session_id)
+        requested_at = utcnow_iso()
+
+        if completion_mode == "inline":
+            session = await self.complete_session(session_id)
+            self._update_finalization_state(
+                session,
+                status="completed",
+                mode="inline",
+                requested_at=requested_at,
+                completed_at=utcnow_iso(),
+                requested_by=requested_by,
+                last_error=None,
+            )
+            session = self.persist_session(session)
+            return session, {
+                "mode": "inline",
+                "status": "completed",
+                "job_id": None,
+            }
+
+        if session.status == "completed":
+            self._update_finalization_state(
+                session,
+                status="completed",
+                mode="queued",
+                requested_at=requested_at,
+                completed_at=utcnow_iso(),
+                requested_by=requested_by,
+                last_error=None,
+            )
+            session = self.persist_session(session)
+            return session, {
+                "mode": "queued",
+                "status": "completed",
+                "job_id": None,
+            }
+
+        job = self._find_pending_finalize_job(session.session_id)
+        if job is None:
+            job = self._runner_store.enqueue_job(
+                RunnerJob(
+                    job_id=uuid4().hex[:12],
+                    job_type="finalize_session",
+                    session_id=session.session_id,
+                    payload={
+                        "requested_by": requested_by,
+                        "requested_at": requested_at,
+                    },
+                )
+            )
+        queue_status = "processing" if job.status == "leased" else "queued"
+        self._update_finalization_state(
+            session,
+            status=queue_status,
+            mode="queued",
+            requested_at=requested_at,
+            requested_by=requested_by,
+            job_id=job.job_id,
+            last_error=None,
+        )
+        session = self.persist_session(session)
+        return session, {
+            "mode": "queued",
+            "status": queue_status,
+            "job_id": job.job_id,
+        }
+
+    async def process_finalization_queue(
+        self,
+        *,
+        limit: int = 1,
+        runner_id: str = "local-meeting-finisher",
+    ) -> dict[str, Any]:
+        leased_jobs = self._runner_store.lease_jobs(limit=max(limit, 1), runner_id=runner_id)
+        processed: list[dict[str, Any]] = []
+        failed: list[dict[str, str]] = []
+
+        for job in leased_jobs:
+            if job.job_type != "finalize_session":
+                self._runner_store.fail_job(
+                    job.job_id,
+                    f"Unsupported runner job type for finalization worker: {job.job_type}",
+                    requeue=False,
+                )
+                failed.append(
+                    {
+                        "job_id": job.job_id,
+                        "session_id": str(job.session_id or ""),
+                        "error": f"Unsupported runner job type: {job.job_type}",
+                    }
+                )
+                continue
+            session_id = str(job.session_id or "").strip()
+            if not session_id:
+                self._runner_store.fail_job(job.job_id, "Finalization job is missing session_id.", requeue=False)
+                failed.append(
+                    {
+                        "job_id": job.job_id,
+                        "session_id": "",
+                        "error": "Finalization job is missing session_id.",
+                    }
+                )
+                continue
+            session = self.get_session(session_id)
+            if session is None:
+                self._runner_store.fail_job(job.job_id, f"Unknown delegate session: {session_id}", requeue=False)
+                failed.append(
+                    {
+                        "job_id": job.job_id,
+                        "session_id": session_id,
+                        "error": f"Unknown delegate session: {session_id}",
+                    }
+                )
+                continue
+
+            self._update_finalization_state(
+                session,
+                status="processing",
+                mode="queued",
+                job_id=job.job_id,
+                runner_id=runner_id,
+                started_at=utcnow_iso(),
+                last_error=None,
+            )
+            self.persist_session(session)
+
+            try:
+                completed_session = await self.complete_session(session_id)
+                completed_at = utcnow_iso()
+                self._update_finalization_state(
+                    completed_session,
+                    status="completed",
+                    mode="queued",
+                    job_id=job.job_id,
+                    runner_id=runner_id,
+                    completed_at=completed_at,
+                    last_error=None,
+                )
+                completed_session = self.persist_session(completed_session)
+                result = {
+                    "job_id": job.job_id,
+                    "session_id": completed_session.session_id,
+                    "status": completed_session.status,
+                    "summary_ready": bool(completed_session.summary),
+                    "summary_exports": len(completed_session.summary_exports),
+                    "completed_at": completed_at,
+                }
+                self._runner_store.complete_job(job.job_id, result)
+                processed.append(result)
+            except Exception as exc:
+                error_message = str(exc).strip() or exc.__class__.__name__
+                latest_session = self.get_session(session_id)
+                if latest_session is not None:
+                    self._update_finalization_state(
+                        latest_session,
+                        status="failed",
+                        mode="queued",
+                        job_id=job.job_id,
+                        runner_id=runner_id,
+                        completed_at=utcnow_iso(),
+                        last_error=error_message,
+                    )
+                    self.persist_session(latest_session)
+                self._runner_store.fail_job(job.job_id, error_message, requeue=False)
+                failed.append(
+                    {
+                        "job_id": job.job_id,
+                        "session_id": session_id,
+                        "error": error_message,
+                    }
+                )
+
+        return {
+            "runner_id": runner_id,
+            "leased_count": len(leased_jobs),
+            "processed_count": len(processed),
+            "failed_count": len(failed),
+            "processed": processed,
+            "failed": failed,
+        }
 
     async def run_auto_completion_watchdog(self) -> None:
         while True:
@@ -1581,17 +1798,27 @@ class DelegateService:
                 watch_state["completion_requested_by"] = "server_watchdog"
                 refreshed.ai_state["meeting_end_watch"] = watch_state
                 self.persist_session(refreshed)
-                await self.complete_session(refreshed.session_id)
+                await self.request_session_completion(
+                    refreshed.session_id,
+                    requested_by="server_watchdog",
+                )
 
     async def recover_incomplete_sessions(self) -> dict[str, Any]:
         recovered_session_ids: list[str] = []
+        queued_session_ids: list[str] = []
         failed: list[dict[str, str]] = []
         for session in self._store.list_sessions():
             if not self._should_attempt_session_recovery(session):
                 continue
             try:
-                await self.complete_session(session.session_id)
-                recovered_session_ids.append(session.session_id)
+                _session, completion = await self.request_session_completion(
+                    session.session_id,
+                    requested_by="startup_recovery",
+                )
+                if str(completion.get("status") or "") == "completed":
+                    recovered_session_ids.append(session.session_id)
+                else:
+                    queued_session_ids.append(session.session_id)
             except Exception as exc:
                 latest = self.get_session(session.session_id) or session
                 latest.ai_state["startup_recovery_error"] = str(exc).strip() or exc.__class__.__name__
@@ -1604,6 +1831,7 @@ class DelegateService:
                 )
         return {
             "recovered_session_ids": recovered_session_ids,
+            "queued_session_ids": queued_session_ids,
             "failed": failed,
         }
 
@@ -1612,12 +1840,20 @@ class DelegateService:
         status_counts: dict[str, int] = {}
         for session in sessions:
             status_counts[session.status] = status_counts.get(session.status, 0) + 1
+        queued_jobs = [job for job in self._runner_store.list_jobs() if job.job_type == "finalize_session"]
+        queued_finalizations = len([job for job in queued_jobs if job.status == "queued"])
+        leased_finalizations = len([job for job in queued_jobs if job.status == "leased"])
         return {
             "service": "local-meeting-ai-runtime",
             "sessions_total": len(sessions),
             "sessions_by_status": status_counts,
             "pdf_export_ready": self._artifact_exporter.pdf_ready,
+            "artifact_export_readiness": self._artifact_exporter.readiness(),
             "audio_transcription_ready": self._ai.can_transcribe_audio,
+            "recording_transcription_strategy": self._ai.recording_transcription_strategy(),
+            "quality_runtime_cache_state": self._ai.quality_runtime_cache_state(),
+            "queued_finalizations": queued_finalizations,
+            "leased_finalizations": leased_finalizations,
             "local_observer_capabilities": self._observer.capabilities,
             "local_observer_audio_devices": self._observer.audio_devices,
             "quality_readiness": self.quality_readiness(),
@@ -1646,6 +1882,10 @@ class DelegateService:
             "gpu_ready": bool(ai_readiness.get("gpu_ready")),
             "faster_whisper_ready": bool(ai_readiness.get("faster_whisper_ready")),
             "pyannote_ready": bool(ai_readiness.get("pyannote_ready")),
+            "provider": str(ai_readiness.get("provider") or "faster_whisper_cuda"),
+            "model": str(ai_readiness.get("model") or ""),
+            "compute_types": list(ai_readiness.get("compute_types") or []),
+            "diarization_provider": str(ai_readiness.get("diarization_provider") or ""),
             "microphone_device_ready": bool(observer_readiness.get("microphone_device_ready")),
             "meeting_output_device_ready": bool(observer_readiness.get("meeting_output_device_ready")),
             "configured_meeting_output_device": (
@@ -1655,6 +1895,31 @@ class DelegateService:
             ),
             "blocking_reasons": blocking_reasons,
         }
+
+    def _resolve_completion_mode(self, requested_mode: str | None) -> str:
+        configured = str(
+            requested_mode
+            or os.getenv("DELEGATE_SESSION_COMPLETION_MODE", "inline")
+        ).strip().lower() or "inline"
+        if configured not in {"inline", "queued"}:
+            raise ValueError("completion mode must be one of: inline, queued")
+        return configured
+
+    def _find_pending_finalize_job(self, session_id: str) -> RunnerJob | None:
+        jobs = [
+            job
+            for job in self._runner_store.list_jobs(session_id=session_id)
+            if job.job_type == "finalize_session" and job.status in {"queued", "leased"}
+        ]
+        if not jobs:
+            return None
+        jobs.sort(key=lambda item: item.created_at, reverse=True)
+        return jobs[0]
+
+    def _update_finalization_state(self, session: DelegateSession, **updates: Any) -> None:
+        state = dict(session.ai_state.get("finalization") or {})
+        state.update({key: value for key, value in updates.items() if value is not None})
+        session.ai_state["finalization"] = state
 
     def _should_attempt_session_recovery(self, session: DelegateSession) -> bool:
         if session.status == "completed":
@@ -2303,8 +2568,9 @@ class DelegateService:
         return path
 
     def _archive_audio_observation(self, session: DelegateSession, observation: dict[str, Any]) -> str | None:
+        artifact_source = self._audio_observation_path(observation, include_archived=False)
         audio_bytes = observation.get("audio_bytes")
-        if not isinstance(audio_bytes, (bytes, bytearray)) or not audio_bytes:
+        if artifact_source is None and (not isinstance(audio_bytes, (bytes, bytearray)) or not audio_bytes):
             return None
         source_name = str(observation.get("audio_source") or "audio").strip() or "audio"
         archived_at = utcnow_iso()
@@ -2320,7 +2586,10 @@ class DelegateService:
             ).astimezone().isoformat()
         stamp = archived_at.replace(":", "").replace(".", "").replace("+00:00", "Z")
         archive_path = self._session_audio_dir(session) / f"{source_name}-{stamp}.wav"
-        archive_path.write_bytes(bytes(audio_bytes))
+        if artifact_source is not None:
+            shutil.copyfile(str(artifact_source), str(archive_path))
+        else:
+            archive_path.write_bytes(bytes(audio_bytes))
         archives = list(session.ai_state.get("audio_archive_paths") or [])
         capture_sequence = len(archives) + 1
         session_start_offset = round(max(archive_start_timestamp - baseline_timestamp, 0.0), 3)
@@ -2366,6 +2635,17 @@ class DelegateService:
         import soundfile as sf
 
         def load_audio(observation: dict[str, Any]) -> tuple[Any, int] | None:
+            observation_path = self._audio_observation_path(observation)
+            if observation_path is not None:
+                try:
+                    audio, rate = sf.read(str(observation_path), dtype="float32")
+                except Exception:
+                    audio = None
+                    rate = None
+                if audio is not None and rate is not None:
+                    if getattr(audio, "ndim", 1) > 1:
+                        audio = audio[:, 0]
+                    return np.asarray(audio, dtype="float32"), int(rate)
             audio_bytes = observation.get("audio_bytes")
             if not isinstance(audio_bytes, (bytes, bytearray)) or not audio_bytes:
                 return None
@@ -2400,7 +2680,6 @@ class DelegateService:
         audio_rms = float(max(float(microphone_observation.get("audio_rms") or 0.0), float(system_observation.get("audio_rms") or 0.0)))
         audio_peak = float(max(float(microphone_observation.get("audio_peak") or 0.0), float(system_observation.get("audio_peak") or 0.0)))
         return {
-            "audio_bytes": output.getvalue(),
             "filename": "conversation-capture.wav",
             "sample_rate": microphone_rate,
             "seconds": max(float(microphone_observation.get("seconds") or 0.0), float(system_observation.get("seconds") or 0.0)),
@@ -2422,6 +2701,34 @@ class DelegateService:
                 "system": system_observation.get("device_name"),
             },
         }
+
+    def _audio_observation_path(
+        self,
+        observation: dict[str, Any],
+        *,
+        include_archived: bool = True,
+    ) -> Path | None:
+        candidate_keys = ["artifact_path"]
+        if include_archived:
+            candidate_keys.insert(0, "archived_path")
+        for key in candidate_keys:
+            candidate = str(observation.get(key) or "").strip()
+            if not candidate:
+                continue
+            path = Path(candidate)
+            if path.exists():
+                return path
+        return None
+
+    async def _transcribe_audio_observation(self, observation: dict[str, Any]) -> list[TranscriptChunk]:
+        filename = str(observation.get("filename") or "audio-capture.wav")
+        recording_path = self._audio_observation_path(observation)
+        if recording_path is not None:
+            return await self._ai.transcribe_recording_path(recording_path, filename=filename)
+        audio_bytes = observation.get("audio_bytes")
+        if isinstance(audio_bytes, (bytes, bytearray)) and audio_bytes:
+            return await self._ai.transcribe_recording_bytes(bytes(audio_bytes), filename=filename)
+        raise LocalObserverError("Captured audio is unavailable for transcription.")
 
     async def _refresh_transcript_from_audio_archive(self, session: DelegateSession) -> DelegateSession:
         merged_audio = await asyncio.to_thread(self._merge_audio_archives_for_final_pass, session)
@@ -2595,7 +2902,7 @@ class DelegateService:
         )
         return {
             "chunks": rebuilt_chunks,
-            "provider": "faster_whisper_cuda",
+            "provider": str(self._ai.quality_readiness().get("provider") or "faster_whisper_cuda"),
             "model": self._ai.quality_readiness().get("model"),
             "compute_type": compute_type,
             "diarization_provider": diarization_provider,
@@ -3112,6 +3419,9 @@ class DelegateService:
             session.summary_exports.extend(self._artifact_exporter.export_summary_bundle(summary_md))
         except ArtifactExportError as exc:
             session.ai_state["artifact_export_error"] = str(exc)
+        finally:
+            if self._auto_cleanup_enabled:
+                self._run_storage_housekeeping()
 
     def _summary_export_stem(self, session: DelegateSession) -> str:
         briefing = dict((session.summary_packet or {}).get("briefing") or {})
@@ -3136,6 +3446,56 @@ class DelegateService:
         cleaned = re.sub(r"-{2,}", "-", cleaned)
         cleaned = cleaned.strip(" .-_")
         return cleaned[:100]
+
+    def _run_storage_housekeeping(self) -> None:
+        try:
+            self._cleanup_observer_tmp_artifacts()
+        except Exception:
+            pass
+        try:
+            self._cleanup_old_audio_archives()
+        except Exception:
+            pass
+
+    def _cleanup_observer_tmp_artifacts(self) -> None:
+        artifact_dir = Path(
+            getattr(self._observer, "_artifact_dir", None)
+            or os.getenv("DELEGATE_LOCAL_OBSERVER_DIR", ".tmp/local-observer")
+        )
+        if not artifact_dir.exists():
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=self._observer_tmp_retention_hours)
+        for path in artifact_dir.glob("*.wav"):
+            try:
+                if not path.is_file():
+                    continue
+                name = path.name.lower()
+                if not (
+                    name.startswith("microphone-live-")
+                    or name.startswith("system-live-")
+                    or name.startswith("conversation-live-")
+                    or name == "conversation-capture.wav"
+                ):
+                    continue
+                modified = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                if modified <= cutoff:
+                    path.unlink(missing_ok=True)
+            except Exception:
+                continue
+
+    def _cleanup_old_audio_archives(self) -> None:
+        keep_count = self._audio_keep_session_count
+        if keep_count <= 0 or not self._audio_archive_dir.exists():
+            return
+        session_dirs = [item for item in self._audio_archive_dir.iterdir() if item.is_dir()]
+        if len(session_dirs) <= keep_count:
+            return
+        session_dirs.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+        for stale_dir in session_dirs[keep_count:]:
+            try:
+                shutil.rmtree(stale_dir, ignore_errors=True)
+            except Exception:
+                continue
 
     def _require_session(self, session_id: str) -> DelegateSession:
         session = self.get_session(session_id)

@@ -9,3 +9,6 @@ zoom-meeting-bot.config.json
 support-bundle-*.json
 .DS_Store
 Thumbs.db
+tools/whisper.cpp/.git/
+tools/whisper.cpp/models/ggml-*.bin
+tools/whisper.cpp/ggml-*.bin

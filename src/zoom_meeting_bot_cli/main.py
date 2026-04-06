@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
-import getpass
 import httpx
 import importlib.metadata
 import importlib.util
@@ -10,7 +9,7 @@ import json
 import platform
 import re
 import shutil
-import subprocess
+import time
 import webbrowser
 from pathlib import Path
 from typing import Any
@@ -23,9 +22,11 @@ from .config import (
     load_config,
     merge_config,
     PRESET_CHOICES,
+    sanitize_text_input,
     suggest_workspace_name,
     write_config,
 )
+from .cuda_support import detect_cuda_gpu, inspect_torch_runtime
 from .launcher_manager import (
     read_launcher_status as read_full_launcher_status,
     start_launcher as start_full_launcher,
@@ -42,6 +43,7 @@ from .runtime_manager import (
 from .runtime_env import package_root, resolve_workspace_path, runtime_host, runtime_port, runtime_state_path
 from .model_manager import prepare_models
 from .package_manager import build_distribution_bundle
+from .platform_support import MACOS, command_candidates_exist, current_platform_id, tool_install_plans
 from .setup_manager import run_setup
 
 EXECUTION_MODE_CHOICES: list[tuple[str, str, str]] = [
@@ -54,6 +56,19 @@ EXECUTION_MODE_CHOICES: list[tuple[str, str, str]] = [
         "launcher",
         "launcher",
         "Zoom 런타임과 artifact 전달 계층을 함께 실행합니다. Telegram 자동 전달까지 고려할 때 적합합니다.",
+    ),
+]
+
+COMPLETION_MODE_CHOICES: list[tuple[str, str, str]] = [
+    (
+        "inline",
+        "inline",
+        "회의 종료 뒤 무거운 후처리를 지금 런타임 안에서 바로 끝냅니다. 기존 동작에 가장 가깝습니다.",
+    ),
+    (
+        "queued",
+        "queued",
+        "회의 종료 뒤 무거운 후처리를 별도 finisher가 이어받습니다. 흐름과 결과물은 유지하면서 메모리 부담을 낮추는 쪽입니다.",
     ),
 ]
 
@@ -155,6 +170,38 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument("--skip-models", action="store_true", help="Skip transcribe/diarization model preparation.")
     setup_parser.set_defaults(func=handle_setup)
 
+    quickstart_parser = subparsers.add_parser(
+        "quickstart",
+        help="Run the first-time setup flow in one command: init/configure/setup/doctor/start.",
+    )
+    quickstart_parser.add_argument(
+        "--preset",
+        choices=PRESET_CHOICES,
+        default="launcher_dm",
+        help="Choose the starting preset when creating a new config. Default: launcher_dm",
+    )
+    quickstart_parser.add_argument(
+        "--force-init",
+        action="store_true",
+        help="Recreate the config from the preset before configuring it.",
+    )
+    quickstart_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Accept recommended setup/model preparation prompts automatically.",
+    )
+    quickstart_parser.add_argument(
+        "--skip-setup",
+        action="store_true",
+        help="Skip the installation/setup step and only run configure/doctor/start.",
+    )
+    quickstart_parser.add_argument(
+        "--skip-start",
+        action="store_true",
+        help="Stop after doctor instead of starting the runtime or launcher.",
+    )
+    quickstart_parser.set_defaults(func=handle_quickstart)
+
     prepare_models_parser = subparsers.add_parser(
         "prepare-models",
         help="Pre-download local transcription and diarization models.",
@@ -229,6 +276,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="browser_auto",
         help="Which URL to open when --open is used. Default: browser_auto",
     )
+    create_session_parser.add_argument(
+        "--no-start",
+        action="store_true",
+        help="Do not auto-start the runtime when it is not reachable.",
+    )
+    create_session_parser.add_argument(
+        "--startup-wait-seconds",
+        type=float,
+        default=20.0,
+        help="How long to wait for the runtime API after auto-start. Default: 20",
+    )
     create_session_parser.set_defaults(func=handle_create_session)
 
     list_sessions_parser = subparsers.add_parser(
@@ -279,7 +337,7 @@ def handle_init(args: argparse.Namespace) -> int:
     config_path: Path = args.config
     if config_path.exists() and not args.force:
         print(f"Config already exists: {config_path}")
-        print("Use --force to overwrite it, or run `zoom-meeting-bot configure`.")
+        print(f"Use --force to overwrite it, or run `{_script_cli_command('configure')}`.")
         return 1
 
     config = build_preset_config(args.preset)
@@ -304,6 +362,71 @@ def handle_configure(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_quickstart(args: argparse.Namespace) -> int:
+    config_path: Path = args.config
+    print("ZOOM_MEETING_BOT quickstart")
+    print(f"- config path: {config_path}")
+    print(f"- preset: {args.preset}")
+
+    if not config_path.exists() or bool(args.force_init):
+        init_result = handle_init(
+            argparse.Namespace(
+                config=config_path,
+                force=True,
+                non_interactive=False,
+                preset=args.preset,
+            )
+        )
+        if init_result != 0:
+            return init_result
+    else:
+        print(f"- existing config found, so init was skipped: {config_path}")
+
+    configure_result = handle_configure(argparse.Namespace(config=config_path))
+    if configure_result != 0:
+        return configure_result
+
+    config = _load_effective_config(config_path)
+    if not bool(args.skip_setup):
+        payload = run_setup(
+            config=config,
+            yes=bool(args.yes),
+            install_python=True,
+            install_tools=True,
+            create_directories=True,
+            prepare_local_models=True,
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        if _setup_requires_reboot(payload):
+            print()
+            print("Quickstart installed a macOS audio driver that requires one reboot before meeting-output capture becomes available.")
+            print("Reboot macOS once, then run the same quickstart command again.")
+            return 0
+
+    doctor_result = handle_doctor(
+        argparse.Namespace(
+            config=config_path,
+            mode="current",
+        )
+    )
+    if doctor_result != 0:
+        return doctor_result
+
+    if bool(args.skip_start):
+        print("Quickstart finished after doctor. Start was skipped by request.")
+        return 0
+
+    return handle_start(argparse.Namespace(config=config_path))
+
+
+def _setup_requires_reboot(payload: dict[str, Any]) -> bool:
+    for raw in list(payload.get("steps") or []):
+        step = dict(raw or {})
+        if bool(step.get("reboot_required")):
+            return True
+    return False
+
+
 def handle_show_config(args: argparse.Namespace) -> int:
     config = _load_effective_config(args.config)
     sanitized = _sanitize_config_for_display(config)
@@ -312,6 +435,7 @@ def handle_show_config(args: argparse.Namespace) -> int:
         "workspace_dir": str(package_root()),
         "execution_mode": _execution_mode(config),
         "execution_mode_label": _choice_label(_execution_mode(config), EXECUTION_MODE_CHOICES),
+        "completion_mode": _completion_mode(config),
         "mode_summary": _mode_summary(config),
         "resolved_paths": _resolved_paths(config),
         "config": sanitized,
@@ -398,15 +522,16 @@ def handle_doctor(args: argparse.Namespace) -> int:
     print(f"- Config path: {config_path}")
 
     if not config_path.exists():
-        problems = ["Config file does not exist. Run `zoom-meeting-bot init` first."]
+        problems = [f"Config file does not exist. Run `{_script_cli_command('init')}` first."]
         _report("config", "missing", "Run init to create the first config file.")
         _print_next_steps(
             problems,
             [],
             [
-                "zoom-meeting-bot init",
-                "zoom-meeting-bot configure",
-                "zoom-meeting-bot doctor",
+                _script_cli_command("quickstart --preset launcher_dm"),
+                _script_cli_command("init"),
+                _script_cli_command("configure"),
+                _script_cli_command("doctor"),
             ],
         )
         return 1
@@ -422,7 +547,7 @@ def handle_doctor(args: argparse.Namespace) -> int:
             [],
             [
                 "Fix the JSON syntax in the config file.",
-                "zoom-meeting-bot doctor",
+                _script_cli_command("doctor"),
             ],
         )
         return 1
@@ -527,7 +652,7 @@ def handle_start(args: argparse.Namespace) -> int:
         print("Start blocked due to unsupported or incomplete launcher/runtime settings.")
         for item in startup_blockers:
             print(f"- {item}")
-        print("Run `zoom-meeting-bot doctor` and `zoom-meeting-bot configure` first.")
+        print(f"Run `{_script_cli_command('doctor')}` and `{_script_cli_command('configure')}` first.")
         return 1
     if _execution_mode(config) == "launcher":
         status = start_full_launcher(config, config_path=args.config)
@@ -559,8 +684,12 @@ def handle_stop(args: argparse.Namespace) -> int:
 
 def handle_create_session(args: argparse.Namespace) -> int:
     config = _load_effective_config(args.config)
-    if not _runtime_api_ready(config):
-        print("Runtime API is not reachable. Start it first with `zoom-meeting-bot start`.")
+    if not _ensure_runtime_api_ready(
+        config,
+        args.config,
+        no_start=bool(args.no_start),
+        wait_seconds=float(args.startup_wait_seconds or 20.0),
+    ):
         return 1
 
     join_url = str(args.join_url or "").strip()
@@ -607,7 +736,7 @@ def handle_create_session(args: argparse.Namespace) -> int:
 def handle_list_sessions(args: argparse.Namespace) -> int:
     config = _load_effective_config(args.config)
     if not _runtime_api_ready(config):
-        print("Runtime API is not reachable. Start it first with `zoom-meeting-bot start`.")
+        print(f"Runtime API is not reachable. Start it first with `{_script_cli_command('start')}`.")
         return 1
 
     payload = list_runtime_sessions(config)
@@ -638,14 +767,14 @@ def handle_list_sessions(args: argparse.Namespace) -> int:
     print()
     print("상세 확인 예시")
     print("-------------")
-    print("- zoom-meeting-bot show-session <session_id>")
+    print(f"- {_script_cli_command('show-session <session_id>')}")
     return 0
 
 
 def handle_show_session(args: argparse.Namespace) -> int:
     config = _load_effective_config(args.config)
     if not _runtime_api_ready(config):
-        print("Runtime API is not reachable. Start it first with `zoom-meeting-bot start`.")
+        print(f"Runtime API is not reachable. Start it first with `{_script_cli_command('start')}`.")
         return 1
 
     payload = get_runtime_session(config, args.session_id)
@@ -661,7 +790,7 @@ def handle_show_session(args: argparse.Namespace) -> int:
 def handle_open_session(args: argparse.Namespace) -> int:
     config = _load_effective_config(args.config)
     if not _runtime_api_ready(config):
-        print("Runtime API is not reachable. Start it first with `zoom-meeting-bot start`.")
+        print(f"Runtime API is not reachable. Start it first with `{_script_cli_command('start')}`.")
         return 1
 
     payload = get_runtime_session(config, args.session_id)
@@ -692,6 +821,47 @@ def _resolve_session_target_url(session: dict[str, Any], target: str) -> str:
         "config": str(join_ticket.get("meeting_sdk_config_url") or "").strip(),
     }
     return url_map.get(target, "")
+
+
+def _ensure_runtime_api_ready(
+    config: dict[str, Any],
+    config_path: Path,
+    *,
+    no_start: bool,
+    wait_seconds: float,
+) -> bool:
+    if _runtime_api_ready(config):
+        return True
+    if no_start:
+        print(f"Runtime API is not reachable. Start it first with `{_script_cli_command('start')}`.")
+        return False
+
+    startup_blockers = _collect_startup_blockers(config)
+    if startup_blockers:
+        print("Runtime API is not reachable, and auto-start was blocked by config issues.")
+        for item in startup_blockers:
+            print(f"- {item}")
+        print(
+            f"Run `{_script_cli_command('quickstart --preset launcher_dm --yes')}` "
+            f"or `{_script_cli_command('doctor')}` first."
+        )
+        return False
+
+    print("Runtime API is not reachable, so the CLI is starting it automatically...")
+    if _execution_mode(config) == "launcher":
+        status = start_full_launcher(config, config_path=config_path)
+    else:
+        status = start_runtime(config, config_path=config_path)
+
+    deadline = time.time() + max(wait_seconds, 1.0)
+    while time.time() < deadline:
+        if _runtime_api_ready(config):
+            return True
+        time.sleep(0.5)
+
+    print("Start was requested, but the runtime API is still not reachable.")
+    print(json.dumps(_decorate_status_payload(config, config_path, status), ensure_ascii=False, indent=2))
+    return False
 
 
 def _load_effective_config(path: Path) -> dict[str, Any]:
@@ -760,8 +930,8 @@ def _resolved_paths(config: dict[str, Any]) -> dict[str, str]:
         "launcher_state_path": str(
             resolve_workspace_path(str(launcher.get("state_path") or ".tmp/zoom-meeting-bot/launcher-state.json"))
         ),
-        "whisper_cpp_command": whisper_cpp_command,
-        "whisper_cpp_model": whisper_cpp_model,
+        "whisper_cpp_command": _display_optional_path(whisper_cpp_command),
+        "whisper_cpp_model": _display_optional_path(whisper_cpp_model),
     }
 
 
@@ -860,12 +1030,12 @@ def _print_created_session_summary(payload: dict[str, Any]) -> None:
     elif desktop_control_url:
         print("- desktop control page를 열고 Zoom Workplace 입장을 진행하세요.")
     else:
-        print("- `zoom-meeting-bot status`로 런타임 상태를 확인한 뒤 join ticket을 다시 확인하세요.")
+        print(f"- `{_script_cli_command('status')}`로 런타임 상태를 확인한 뒤 join ticket을 다시 확인하세요.")
 
     if readiness == "blocked":
-        print("- preflight가 blocked 상태이므로 `zoom-meeting-bot doctor`와 설정값을 먼저 다시 확인하세요.")
+        print(f"- preflight가 blocked 상태이므로 `{_script_cli_command('doctor')}`와 설정값을 먼저 다시 확인하세요.")
     else:
-        print(f"- 상세 내용은 `zoom-meeting-bot show-session {session_id}`로 다시 확인할 수 있습니다.")
+        print(f"- 상세 내용은 `{_script_cli_command(f'show-session {session_id}')}`로 다시 확인할 수 있습니다.")
 
 
 def _print_session_detail_summary(session: dict[str, Any]) -> None:
@@ -987,6 +1157,11 @@ def _collect_interactive_config(config: dict[str, Any]) -> dict[str, Any]:
         str(updated["runtime"]["audio_mode"]),
         ("conversation", "mixed", "microphone", "system"),
     )
+    updated["runtime"]["completion_mode"] = _prompt_described_choice(
+        "session completion mode",
+        str(updated["runtime"].get("completion_mode") or "inline"),
+        COMPLETION_MODE_CHOICES,
+    )
     if str(updated["runtime"]["execution_mode"]) == "launcher":
         _print_section("5. Launcher")
         print("launcher 모드는 Zoom 런타임과 artifact 전달 계층을 함께 실행합니다.")
@@ -1049,8 +1224,12 @@ def _prompt(label: str, current: str, *, help_text: str = "") -> str:
     if help_text:
         print(f"   {help_text}")
     suffix = f" [{current}]" if current else ""
-    value = input(f"{label}{suffix}: ").strip()
-    return value or current
+    value = input(f"{label}{suffix}: ")
+    cleaned = sanitize_text_input(value)
+    if value and cleaned != value.strip():
+        print("   Hidden control characters were removed from the value.")
+    current_clean = sanitize_text_input(current)
+    return cleaned or current_clean
 
 
 def _prompt_required(label: str, current: str, *, help_text: str = "") -> str:
@@ -1065,8 +1244,12 @@ def _prompt_secret(label: str, current: str, *, help_text: str = "") -> str:
     if help_text:
         print(f"   {help_text}")
     suffix = " [configured]" if current else ""
-    value = getpass.getpass(f"{label}{suffix}: ").strip()
-    return value or current
+    value = input(f"{label}{suffix}: ")
+    cleaned = sanitize_text_input(value)
+    if value and cleaned != value.strip():
+        print("   Hidden control characters were removed from the value.")
+    current_clean = sanitize_text_input(current)
+    return cleaned or current_clean
 
 
 def _prompt_bool(label: str, current: bool) -> bool:
@@ -1261,6 +1444,12 @@ def _execution_mode(config: dict[str, Any]) -> str:
     return mode or "runtime_only"
 
 
+def _completion_mode(config: dict[str, Any]) -> str:
+    runtime = dict(config.get("runtime") or {})
+    mode = str(runtime.get("completion_mode") or "inline").strip()
+    return mode or "inline"
+
+
 def _decorate_status_payload(config: dict[str, Any], config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
     execution_mode = _execution_mode(config)
     telegram = dict(config.get("telegram") or {})
@@ -1269,6 +1458,7 @@ def _decorate_status_payload(config: dict[str, Any], config_path: Path, payload:
     decorated["config_path"] = str(config_path.resolve())
     decorated["execution_mode"] = execution_mode
     decorated["execution_mode_label"] = _choice_label(execution_mode, EXECUTION_MODE_CHOICES)
+    decorated["completion_mode"] = _completion_mode(config)
     decorated["mode_summary"] = _mode_summary(config)
     decorated["telegram"] = {
         "enabled": bool(telegram.get("enabled")),
@@ -1349,21 +1539,20 @@ def _recommended_next_steps(
     problem_text = " ".join(blocking_problems)
 
     if "Missing executable" in problem_text:
-        steps.append("zoom-meeting-bot setup")
+        steps.append(_script_cli_command("setup"))
     if "Missing required value" in problem_text:
-        steps.append("zoom-meeting-bot configure")
+        steps.append(_script_cli_command("configure"))
     if "launcher.metheus_route_name" in problem_text:
-        steps.append("zoom-meeting-bot configure")
+        steps.append(_script_cli_command("configure"))
     if "telegram." in problem_text and requested_mode == "launcher":
-        steps.append("zoom-meeting-bot configure")
+        steps.append(_script_cli_command("configure"))
     if "Unsupported route combination" in problem_text:
-        steps.append("zoom-meeting-bot configure")
+        steps.append(_script_cli_command("configure"))
 
     if not blocking_problems:
-        steps.append("zoom-meeting-bot start")
-        steps.append("zoom-meeting-bot status")
         if requested_mode in {"runtime_only", "launcher"}:
-            steps.append('zoom-meeting-bot create-session "https://us06web.zoom.us/j/..." --passcode "123456"')
+            steps.append(_script_cli_command('create-session "https://us06web.zoom.us/j/..." --passcode "123456"'))
+        steps.append(_script_cli_command("status"))
 
     # remove duplicates while preserving order
     unique_steps: list[str] = []
@@ -1387,6 +1576,12 @@ def _print_next_steps(problems: list[str], warnings: list[str], steps: list[str]
         print("- this config looks usable. Recommended next commands:")
     for step in steps:
         print(f"- {step}")
+
+
+def _script_cli_command(args: str) -> str:
+    prefix = ".\\scripts\\zoom-meeting-bot.ps1" if current_platform_id() == "windows" else "./scripts/zoom-meeting-bot.sh"
+    suffix = str(args or "").strip()
+    return f"{prefix} {suffix}".strip()
 
 
 def _describe_route(route: dict[str, Any]) -> str:
@@ -1476,39 +1671,93 @@ def _detect_repeated_prefix(value: str) -> str:
 
 
 def _check_command(command_name: str, label: str, bucket: list[str]) -> None:
-    if shutil.which(command_name):
-        _report(label, "ok", f"Found `{command_name}` in PATH.")
-    else:
-        bucket.append(f"Missing executable: {command_name}")
-        _report(label, "missing", f"`{command_name}` was not found in PATH.")
+    candidates = _command_candidates_for_check(command_name, label)
+    found, resolved = command_candidates_exist(candidates)
+    if found:
+        _report(label, "ok", f"Found `{resolved}`.")
+        return
+    bucket.append(f"Missing executable: {command_name}")
+    _report(label, "missing", f"`{command_name}` was not found.")
+
+
+def _command_candidates_for_check(command_name: str, label: str) -> tuple[str, ...]:
+    candidates: list[str] = []
+    configured = str(command_name or "").strip()
+    if configured:
+        candidates.append(configured)
+    step_name = ""
+    if label == "pandoc":
+        step_name = "pandoc"
+    elif label == "libreoffice/soffice":
+        step_name = "libreoffice"
+    elif label == "ffmpeg":
+        step_name = "ffmpeg"
+    if step_name:
+        for plan in tool_install_plans():
+            if plan.step_name == step_name:
+                candidates.extend(plan.command_candidates)
+                break
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate or "").strip().casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(str(candidate).strip())
+    return tuple(deduped)
 
 
 def _check_local_quality_dependencies(config: dict[str, Any], problems: list[str], warnings: list[str]) -> None:
     runtime = dict(config.get("runtime") or {})
     local_ai = dict(config.get("local_ai") or {})
     audio_mode = str(runtime.get("audio_mode") or "conversation").strip() or "conversation"
+    platform_id = current_platform_id()
     gpu_detected, gpu_detail = _detect_cuda_gpu()
+    torch_runtime = inspect_torch_runtime()
 
     _check_package_version(
         "starlette",
         expected_version="0.52.1",
         bucket=problems,
         required=True,
-        mismatch_message="The runtime engine expects Starlette 0.52.1. Re-run `zoom-meeting-bot setup` or reinstall the kit dependencies.",
+        mismatch_message=f"The runtime engine expects Starlette 0.52.1. Re-run `{_script_cli_command('setup')}` or reinstall the kit dependencies.",
     )
     _check_package_version(
         "uvicorn",
         expected_version="0.42.0",
         bucket=problems,
         required=True,
-        mismatch_message="The runtime engine expects Uvicorn 0.42.0. Re-run `zoom-meeting-bot setup` or reinstall the kit dependencies.",
+        mismatch_message=f"The runtime engine expects Uvicorn 0.42.0. Re-run `{_script_cli_command('setup')}` or reinstall the kit dependencies.",
     )
 
     if gpu_detected:
         _report("cuda_gpu", "ok", f"Detected CUDA-capable GPU via {gpu_detail}.")
     else:
-        warnings.append("CUDA-capable GPU was not detected. The kit may need a fallback transcription path.")
-        _report("cuda_gpu", "warning", "CUDA-capable GPU was not detected.")
+        if platform_id == MACOS:
+            _report(
+                "cuda_gpu",
+                "warning",
+                "CUDA-capable GPU was not detected. macOS will use the CPU final-offline transcription path when available.",
+            )
+        else:
+            warnings.append("CUDA-capable GPU was not detected. The kit may need a fallback transcription path.")
+            _report("cuda_gpu", "warning", "CUDA-capable GPU was not detected.")
+
+    if bool(torch_runtime.get("cuda_enabled")):
+        _report("torch.cuda runtime", "ok", str(torch_runtime.get("detail") or "CUDA-enabled torch runtime is ready."))
+    elif gpu_detected:
+        message = (
+            "CUDA-capable GPU is present, but the installed torch runtime cannot use CUDA. "
+            f"Re-run `{_script_cli_command('setup --yes')}` so quickstart/setup can install the CUDA torch runtime."
+        )
+        problems.append(message)
+        _report("torch.cuda runtime", "missing", str(torch_runtime.get("detail") or message))
+    elif bool(torch_runtime.get("installed")):
+        _report("torch.cuda runtime", "warning", str(torch_runtime.get("detail") or "torch is installed without CUDA."))
+    else:
+        warnings.append("torch is not installed yet, so CUDA quality readiness could not be verified.")
+        _report("torch.cuda runtime", "warning", str(torch_runtime.get("detail") or "torch is not installed."))
 
     if audio_mode in {"conversation", "mixed", "system"}:
         _check_python_module("soundcard", "soundcard", problems, required=True)
@@ -1535,6 +1784,30 @@ def _check_local_quality_dependencies(config: dict[str, Any], problems: list[str
         missing_message="whisper.cpp model path is not configured. Short live-audio fallback quality may differ from the golden reference.",
         expect_file=True,
     )
+    if platform_id == MACOS and audio_mode in {"conversation", "mixed", "system"}:
+        from local_meeting_ai_runtime.local_observer import LocalObserver
+
+        observer_readiness = LocalObserver().audio_quality_readiness()
+        microphone_ready = bool(observer_readiness.get("microphone_device_ready"))
+        meeting_output_ready = bool(observer_readiness.get("meeting_output_device_ready"))
+        if microphone_ready:
+            _report("observer.microphone_device", "ok", "Configured/default microphone device is available.")
+        else:
+            for reason in observer_readiness.get("blocking_reasons") or []:
+                if "microphone" in str(reason).lower() and reason not in problems:
+                    problems.append(str(reason))
+            _report("observer.microphone_device", "missing", "Configured/default microphone device is not ready.")
+        if meeting_output_ready:
+            _report("observer.meeting_output_device", "ok", "Configured meeting output device is available.")
+        else:
+            for reason in observer_readiness.get("blocking_reasons") or []:
+                if "meeting output" in str(reason).lower() and reason not in problems:
+                    problems.append(str(reason))
+            _report("observer.meeting_output_device", "missing", "Configured meeting output device is not ready.")
+        for note in observer_readiness.get("quality_notes") or []:
+            note_text = str(note).strip()
+            if note_text and note_text not in warnings:
+                warnings.append(note_text)
 
 
 def _check_python_module(module_name: str, label: str, bucket: list[str], *, required: bool) -> None:
@@ -1603,43 +1876,39 @@ def _check_optional_path(
         warnings.append(missing_message)
         _report(label, "warning", missing_message)
         return
-    path = Path(path_text).expanduser()
-    exists = path.is_file() if expect_file else path.exists()
+    path = _resolve_optional_path_for_check(path_text)
+    exists = bool(path and (path.is_file() if expect_file else path.exists()))
     if exists:
         _report(label, "ok", f"Found `{path}`.")
         return
-    warnings.append(f"{label} was not found: {path}")
-    _report(label, "warning", f"`{path}` was not found.")
+    warnings.append(f"{label} was not found: {path_text}")
+    _report(label, "warning", f"`{path_text}` was not found.")
+
+
+def _resolve_optional_path_for_check(value: str) -> Path | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    if "/" in text or "\\" in text:
+        return resolve_workspace_path(text)
+    resolved = shutil.which(text)
+    if resolved:
+        return Path(resolved).resolve()
+    return None
+
+
+def _display_optional_path(value: str) -> str:
+    resolved = _resolve_optional_path_for_check(value)
+    if resolved is not None:
+        return str(resolved)
+    return str(value or "").strip()
 
 
 def _detect_cuda_gpu() -> tuple[bool, str]:
-    try:
-        if importlib.util.find_spec("torch") is not None:
-            import torch  # type: ignore[import-not-found]
-
-            if bool(torch.cuda.is_available()):
-                return True, "torch.cuda"
-    except Exception:
-        pass
-
-    try:
-        nvidia_smi = shutil.which("nvidia-smi")
-        if not nvidia_smi:
-            return False, "nvidia-smi not found"
-        result = subprocess.run(
-            [nvidia_smi, "-L"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            check=False,
-            timeout=5,
-        )
-        if result.returncode == 0 and str(result.stdout or "").strip():
-            return True, "nvidia-smi"
-        return False, "nvidia-smi returned no devices"
-    except Exception as exc:
-        return False, str(exc).strip() or exc.__class__.__name__
+    return detect_cuda_gpu()
 
 
 def _check_telegram_config(config: dict[str, Any], problems: list[str], warnings: list[str]) -> None:

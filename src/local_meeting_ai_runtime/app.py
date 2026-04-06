@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ from .artifact_exporter import MeetingArtifactExporter
 from .local_observer import LocalObserver, LocalObserverError
 from .meeting_adapter import MeetingSdkAdapter, MeetingSdkError
 from .service import DelegateService
-from .storage import SessionStore
+from .storage import RunnerQueueStore, SessionStore
 from .summary_pipeline import DelegateSummaryPipeline
 from .zoom_client import ZoomRestClient, ZoomRuntimeError
 
@@ -43,10 +44,18 @@ def _base_url(request: Request) -> str:
     return f"{scheme}://{host}"
 
 
-def create_service(*, store_path: str | None = None, export_dir: str | None = None) -> DelegateService:
+def create_service(
+    *,
+    store_path: str | None = None,
+    export_dir: str | None = None,
+    runner_queue_path: str | None = None,
+) -> DelegateService:
     _load_dotenv()
     return DelegateService(
         store=SessionStore(path=store_path or os.getenv("DELEGATE_STORE_PATH", "data/delegate_sessions.json")),
+        runner_store=RunnerQueueStore(
+            path=runner_queue_path or os.getenv("DELEGATE_RUNNER_QUEUE_PATH", "data/runner_queue.json")
+        ),
         zoom_client=ZoomRestClient(),
         ai_client=AiDelegateClient(),
         meeting_adapter=MeetingSdkAdapter(),
@@ -57,8 +66,17 @@ def create_service(*, store_path: str | None = None, export_dir: str | None = No
     )
 
 
-def create_app(*, store_path: str | None = None, export_dir: str | None = None) -> Starlette:
-    service = create_service(store_path=store_path, export_dir=export_dir)
+def create_app(
+    *,
+    store_path: str | None = None,
+    export_dir: str | None = None,
+    runner_queue_path: str | None = None,
+) -> Starlette:
+    service = create_service(
+        store_path=store_path,
+        export_dir=export_dir,
+        runner_queue_path=runner_queue_path,
+    )
     watchdog_task: asyncio.Task[None] | None = None
 
     async def startup() -> None:
@@ -148,7 +166,9 @@ def create_app(*, store_path: str | None = None, export_dir: str | None = None) 
             return HTMLResponse("<h1>Unknown delegate session</h1>", status_code=404)
 
         join_ticket = service.refresh_join_ticket(session.session_id, base_url=_base_url(request))
-        title = "WooBIN_bot Zoom Entrance"
+        delegate_name = session.bot_display_name or "Delegate Bot"
+        safe_delegate_name = html_lib.escape(delegate_name)
+        title = f"{safe_delegate_name} Zoom Entrance"
         meeting_label = session.meeting_topic or session.meeting_number or session.meeting_id or "Unknown meeting"
         config_url = f"{_base_url(request)}/delegate/sessions/{session.session_id}/meeting-sdk-config"
         sdk_script_url = str(join_ticket.get("sdk_script_url") or "")
@@ -239,10 +259,10 @@ def create_app(*, store_path: str | None = None, export_dir: str | None = None) 
     {vendor_tags}
     <script src="{sdk_script_url}" defer></script>
   </head>
-  <body>
+    <body>
     <main>
       <section class="card">
-        <h1>WooBIN_bot Zoom Entrance</h1>
+        <h1>{safe_delegate_name} Zoom Entrance</h1>
         <p>이 페이지는 Zoom 출입구입니다. 실제 회의 이해와 수집은 뒤의 로컬 AI 본체가 담당합니다.</p>
         <div class="meta">
           <strong>Meeting</strong>: {meeting_label}<br>
@@ -260,6 +280,7 @@ def create_app(*, store_path: str | None = None, export_dir: str | None = None) 
     </main>
     <script>
       const configUrl = {json.dumps(config_url)};
+      const delegateName = {json.dumps(delegate_name)};
       const browserReady = {browser_ready};
       const statusEl = document.getElementById("status");
       const joinButton = document.getElementById("joinButton");
@@ -291,7 +312,7 @@ def create_app(*, store_path: str | None = None, export_dir: str | None = None) 
             zoomAppRoot: document.getElementById("meetingSDKElement"),
             ...config.initOptions
           }});
-          statusEl.textContent = "Joining meeting as WooBIN_bot...";
+          statusEl.textContent = "Joining meeting as " + delegateName + "...";
           await client.join({{
             sdkKey: config.sdkKey,
             signature: config.signature,
@@ -301,7 +322,7 @@ def create_app(*, store_path: str | None = None, export_dir: str | None = None) 
             userEmail: config.userEmail,
             zak: config.zakToken
           }});
-          statusEl.textContent = "WooBIN_bot joined the meeting.";
+          statusEl.textContent = delegateName + " joined the meeting.";
         }} catch (error) {{
           statusEl.textContent = "Join failed: " + (error && error.message ? error.message : String(error));
           joinButton.disabled = false;
@@ -323,7 +344,9 @@ def create_app(*, store_path: str | None = None, export_dir: str | None = None) 
         auto_mode = str(request.query_params.get("auto") or "").strip().lower()
         if auto_mode not in {"browser", "desktop"}:
             auto_mode = ""
-        title = "WooBIN_bot Zoom Entrance"
+        delegate_name = session.bot_display_name or "Delegate Bot"
+        safe_delegate_name = html_lib.escape(delegate_name)
+        title = f"{safe_delegate_name} Zoom Entrance"
         meeting_label = session.meeting_topic or session.meeting_number or session.meeting_id or "Unknown meeting"
         config_url = f"{_base_url(request)}/delegate/sessions/{session.session_id}/meeting-sdk-config"
         inputs_url = f"{_base_url(request)}/delegate/sessions/{session.session_id}/inputs"
@@ -427,10 +450,10 @@ def create_app(*, store_path: str | None = None, export_dir: str | None = None) 
     {vendor_tags}
     <script src="{sdk_script_url}" defer></script>
   </head>
-  <body>
+    <body>
     <main>
       <section class="card">
-        <h1>WooBIN_bot Zoom Entrance</h1>
+        <h1>{safe_delegate_name} Zoom Entrance</h1>
         <p>이 페이지는 Zoom 출입구입니다. 실제 회의 이해와 수집은 뒤의 로컬 AI 본체가 담당합니다.</p>
         <div class="meta">
           <strong>Meeting</strong>: {meeting_label}<br>
@@ -685,7 +708,7 @@ def create_app(*, store_path: str | None = None, export_dir: str | None = None) 
               }}
             }}
           ]);
-          statusEl.textContent = "WooBIN_bot replied in the meeting chat.";
+          statusEl.textContent = delegateName + " replied in the meeting chat.";
         }} catch (error) {{
           statusEl.textContent = "Reply draft prepared, but Zoom chat publish failed.";
           console.warn("Failed to publish delegate reply via Zoom chat.", error);
@@ -1033,7 +1056,7 @@ def create_app(*, store_path: str | None = None, export_dir: str | None = None) 
             ...config.initOptions
           }});
           await attachInputObservers(client, config);
-          statusEl.textContent = "Joining meeting in browser as WooBIN_bot...";
+          statusEl.textContent = "Joining meeting in browser as " + delegateName + "...";
           await client.join({{
             sdkKey: config.sdkKey,
             signature: config.signature,
@@ -1066,7 +1089,7 @@ def create_app(*, store_path: str | None = None, export_dir: str | None = None) 
           startAudioObserver().catch((error) => {{
             console.warn("Failed to start continuous local audio observation.", error);
           }});
-          statusEl.textContent = "WooBIN_bot joined the meeting in browser.";
+          statusEl.textContent = delegateName + " joined the meeting in browser.";
           return true;
         }} catch (error) {{
           const detail = formatJoinError(error);
@@ -1163,24 +1186,39 @@ def create_app(*, store_path: str | None = None, export_dir: str | None = None) 
         if session is None:
             return HTMLResponse("<h1>Unknown delegate session</h1>", status_code=404)
 
+        leave_completion = None
         leave_completion_error: str | None = None
         try:
-            session = await service.complete_session(session.session_id)
+            session, leave_completion = await service.request_session_completion(
+                session.session_id,
+                requested_by="leave_page",
+            )
         except Exception as exc:
             refreshed = service.get_session(session.session_id)
             if refreshed is not None:
                 session = refreshed
             leave_completion_error = str(exc).strip() or exc.__class__.__name__
+        finalization_state = dict(session.ai_state.get("finalization") or {})
+        if leave_completion is None:
+            leave_completion = {
+                "mode": str(finalization_state.get("mode") or "inline"),
+                "status": str(
+                    finalization_state.get("status")
+                    or ("completed" if session.status == "completed" else "pending")
+                ),
+                "job_id": finalization_state.get("job_id"),
+            }
 
         complete_url = f"{_base_url(request)}/delegate/sessions/{session.session_id}/complete"
         session_url = f"{_base_url(request)}/delegate/sessions/{session.session_id}"
+        session_payload = session.to_dict()
 
         html = f"""<!doctype html>
 <html lang="ko">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>WooBIN_bot Meeting Wrap-up</title>
+    <title>{html_lib.escape(session.bot_display_name or "Delegate Bot")} Meeting Wrap-up</title>
     <style>
       body {{
         margin: 0;
@@ -1236,10 +1274,10 @@ def create_app(*, store_path: str | None = None, export_dir: str | None = None) 
       }}
     </style>
   </head>
-  <body>
+    <body>
     <main>
       <section class="card">
-        <h1>WooBIN_bot Meeting Wrap-up</h1>
+        <h1>{html_lib.escape(session.bot_display_name or "Delegate Bot")} Meeting Wrap-up</h1>
         <p>회의를 종료했습니다. 지금부터 로컬 AI 본체가 회의 내용을 정리하고 요약/PDF 생성을 마무리합니다.</p>
         <div class="status" id="status">요약과 PDF를 생성하는 중입니다...</div>
         <div class="links" id="links"></div>
@@ -1247,6 +1285,8 @@ def create_app(*, store_path: str | None = None, export_dir: str | None = None) 
       </section>
     </main>
     <script>
+      const initialSession = {json.dumps(session_payload)};
+      const initialCompletion = {json.dumps(leave_completion)};
       const completeUrl = {json.dumps(complete_url)};
       const sessionUrl = {json.dumps(session_url)};
       const leaveCompletionError = {json.dumps(leave_completion_error)};
@@ -1272,29 +1312,106 @@ def create_app(*, store_path: str | None = None, export_dir: str | None = None) 
         }}
       }}
 
+      function finalizationStateFromSession(session) {{
+        const aiState = session && session.ai_state && typeof session.ai_state === "object"
+          ? session.ai_state
+          : {{}};
+        const finalization = aiState && aiState.finalization && typeof aiState.finalization === "object"
+          ? aiState.finalization
+          : {{}};
+        return {{
+          mode: finalization.mode || null,
+          status: finalization.status || null,
+          job_id: finalization.job_id || null,
+        }};
+      }}
+
+      function renderCompletion(session, completion) {{
+        const safeSession = session && typeof session === "object" ? session : {{}};
+        const safeCompletion = completion && typeof completion === "object" ? completion : {{}};
+        const mode = String(safeCompletion.mode || "");
+        const status = String(safeCompletion.status || "");
+
+        renderLinks(safeSession);
+        if (safeSession.summary) {{
+          summaryEl.textContent = safeSession.summary;
+        }} else if (mode === "queued") {{
+          summaryEl.textContent = "The final summary and PDF are being prepared by the finisher.";
+        }} else {{
+          summaryEl.textContent = "The final summary is not ready yet.";
+        }}
+
+        if (status === "completed" || safeSession.status === "completed") {{
+          statusEl.textContent = "Meeting summary and exports are ready.";
+          return;
+        }}
+
+        if (mode === "queued") {{
+          statusEl.textContent = "Meeting wrap-up has been queued in the finisher. This page will refresh until the summary and PDF are ready.";
+          return;
+        }}
+
+        statusEl.textContent = "Meeting wrap-up is still running.";
+      }}
+
+      async function fetchLatestSession() {{
+        const response = await fetch(sessionUrl, {{ credentials: "same-origin" }});
+        const payload = await response.json();
+        if (!response.ok || !payload.ok || !payload.session) {{
+          throw new Error(payload.error || "Failed to load the latest session state.");
+        }}
+        return payload.session;
+      }}
+
+      async function pollQueuedCompletion(maxAttempts = 20) {{
+        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {{
+          await new Promise((resolve) => window.setTimeout(resolve, 3000));
+          try {{
+            const session = await fetchLatestSession();
+            const completion = finalizationStateFromSession(session);
+            renderCompletion(session, completion);
+            if (String(completion.status || "") === "completed" || session.status === "completed") {{
+              return;
+            }}
+          }} catch (error) {{
+            console.warn("Failed to refresh queued finalization state.", error);
+          }}
+        }}
+        statusEl.textContent = "Meeting wrap-up is still queued. Refresh this page again after the finisher completes.";
+      }}
+
       async function finalizeSession() {{
         if (leaveCompletionError) {{
           console.warn("Leave-page server-side completion failed.", leaveCompletionError);
+        }} else {{
+          renderCompletion(initialSession, initialCompletion);
+          const initialMode = String((initialCompletion && initialCompletion.mode) || "");
+          const initialStatus = String((initialCompletion && initialCompletion.status) || "");
+          if (initialStatus === "completed" || (initialSession && initialSession.status === "completed")) {{
+            return;
+          }}
+          if (initialMode === "queued") {{
+            await pollQueuedCompletion();
+            return;
+          }}
         }}
         try {{
           const response = await fetch(completeUrl, {{ method: "POST", credentials: "same-origin" }});
           const payload = await response.json();
           if (!response.ok || !payload.ok) {{
-            throw new Error(payload.error || "자동 완료에 실패했습니다.");
+            throw new Error(payload.error || "Automatic wrap-up failed.");
           }}
-          const session = payload.session || {{}};
-          statusEl.textContent = "회의 요약과 PDF 생성이 완료되었습니다.";
-          summaryEl.textContent = session.summary || "요약문이 아직 없습니다.";
-          renderLinks(session);
+          const refreshedSession = payload.session || {{}};
+          const completion = payload.completion || finalizationStateFromSession(refreshedSession);
+          renderCompletion(refreshedSession, completion);
+          if (String(completion.mode || "") === "queued" && String(completion.status || "") !== "completed") {{
+            await pollQueuedCompletion();
+          }}
         }} catch (error) {{
-          statusEl.textContent = "자동 완료 중 오류가 발생했습니다. 세션 상태를 다시 불러옵니다.";
+          statusEl.textContent = "Automatic wrap-up hit an error. Reloading the latest session state.";
           try {{
-            const fallback = await fetch(sessionUrl, {{ credentials: "same-origin" }});
-            const fallbackPayload = await fallback.json();
-            if (fallback.ok && fallbackPayload.ok && fallbackPayload.session) {{
-              summaryEl.textContent = fallbackPayload.session.summary || "요약문이 아직 없습니다.";
-              renderLinks(fallbackPayload.session);
-            }}
+            const fallbackSession = await fetchLatestSession();
+            renderCompletion(fallbackSession, finalizationStateFromSession(fallbackSession));
           }} catch (_fallbackError) {{
           }}
           console.warn("Failed to auto-complete on leave page.", error);
@@ -1376,10 +1493,22 @@ def create_app(*, store_path: str | None = None, export_dir: str | None = None) 
 
     async def complete_session(request: Request) -> JSONResponse:
         try:
-            session = await service.complete_session(request.path_params["session_id"])
+            try:
+                payload = await request.json()
+                if not isinstance(payload, dict):
+                    payload = {}
+            except Exception:
+                payload = {}
+            session, completion = await service.request_session_completion(
+                request.path_params["session_id"],
+                mode=str(payload.get("mode") or "").strip() or None,
+                requested_by=str(payload.get("requested_by") or "api").strip() or "api",
+            )
         except KeyError as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
-        return JSONResponse({"ok": True, "session": session.to_dict()})
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True, "session": session.to_dict(), "completion": completion})
 
     async def summary_package(request: Request) -> JSONResponse:
         session = service.get_session(request.path_params["session_id"])
