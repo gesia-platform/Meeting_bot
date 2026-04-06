@@ -423,15 +423,22 @@ macOS:
 
 ### 2. 처음 준비 한 번에 끝내기
 
-개인 Telegram DM까지 받아보는 기본 경로는 아래 한 줄입니다.
+개인 Telegram DM까지 받아보는 기본 경로는 OS별로 아래 한 줄입니다.
+
+Windows:
 
 ```powershell
 .\scripts\zoom-meeting-bot.ps1 quickstart --preset launcher_dm --yes
 ```
 
-macOS parity notes:
+macOS:
 
-- macOS uses the same `quickstart -> doctor -> start` flow via `./scripts/zoom-meeting-bot.sh quickstart --preset launcher_dm --yes`.
+```bash
+./scripts/zoom-meeting-bot.sh quickstart --preset launcher_dm --yes
+```
+
+macOS notes:
+
 - If bundled `whisper.cpp` does not already contain a macOS CLI, `setup` first tries a Homebrew `whisper-cpp` install and only builds `tools/whisper.cpp/build-macos` as a last resort.
 - If CUDA is unavailable on macOS, final offline transcription uses the local CPU `faster-whisper` path.
 
@@ -450,16 +457,32 @@ macOS parity notes:
 - `launcher_dm`은 회의 종료 후 PDF를 개인 Telegram DM으로 받는 기본 preset입니다.
 - `--yes`는 설치/준비 단계에서 추천 선택지를 자동으로 받습니다.
 - Windows에서 NVIDIA GPU가 감지되면 `setup`이 CUDA용 `torch`/`torchaudio`도 자동으로 맞춰서 final transcription 품질 경로를 살리려 시도합니다.
-- PDF까지만 먼저 보고 싶으면 아래처럼 `runtime_only`를 쓰시면 됩니다.
+- PDF까지만 먼저 보고 싶으면 아래처럼 OS별 `runtime_only`를 쓰시면 됩니다.
+
+Windows:
 
 ```powershell
 .\scripts\zoom-meeting-bot.ps1 quickstart --preset runtime_only --yes
 ```
 
+macOS:
+
+```bash
+./scripts/zoom-meeting-bot.sh quickstart --preset runtime_only --yes
+```
+
 ### 3. 회의 세션 만들기
+
+Windows:
 
 ```powershell
 .\scripts\zoom-meeting-bot.ps1 create-session "회의링크" --passcode "암호" --open
+```
+
+macOS:
+
+```bash
+./scripts/zoom-meeting-bot.sh create-session "회의링크" --passcode "암호" --open
 ```
 
 이 명령은 회의 세션을 만들고, 런타임이 아직 안 떠 있으면 자동으로 시작한 뒤 회의 진입 페이지까지 엽니다.
