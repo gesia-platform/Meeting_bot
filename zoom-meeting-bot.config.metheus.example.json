@@ -29,7 +29,7 @@
     "generated_meeting_output_dir": "skills/generated"
   },
   "meeting_artifacts": {
-    "pdf_renderer": "docx"
+    "pdf_renderer": "html"
   },
   "telegram": {
     "enabled": true,

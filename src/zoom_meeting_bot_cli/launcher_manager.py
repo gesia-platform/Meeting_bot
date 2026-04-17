@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .launcher_env import build_launcher_env, launcher_state_path
+from .paths import workspace_root
 from .runtime_env import package_root
 
 
@@ -41,11 +42,15 @@ def _run_launcher_command(config: dict[str, Any], *, config_path: Path, command:
         return {
             "status": "unknown",
             "config_path": str(config_path.resolve()),
+            "workspace_dir": str(workspace_root()),
+            "package_dir": str(package_root()),
             "state_path": str(launcher_state_path(config)),
         }
     parsed = json.loads(payload)
     if isinstance(parsed, dict):
         parsed["config_path"] = str(config_path.resolve())
+        parsed.setdefault("workspace_dir", str(workspace_root()))
+        parsed.setdefault("package_dir", str(package_root()))
         parsed.setdefault("state_path", str(launcher_state_path(config)))
         return parsed
     raise RuntimeError("Launcher output was not a JSON object.")

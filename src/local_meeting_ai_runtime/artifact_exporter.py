@@ -178,7 +178,7 @@ class MeetingArtifactExporter:
         return command
 
     def _selected_pdf_renderer(self) -> str:
-        raw = str(os.getenv("DELEGATE_MEETING_ARTIFACT_PDF_RENDERER", "docx")).strip().lower()
+        raw = str(os.getenv("DELEGATE_MEETING_ARTIFACT_PDF_RENDERER", "html")).strip().lower()
         if raw == "html":
             return "html"
         return "docx"

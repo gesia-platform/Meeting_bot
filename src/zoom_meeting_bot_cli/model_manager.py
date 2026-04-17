@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .paths import workspace_root
 from .runtime_env import build_runtime_env, package_root
 
 
@@ -83,7 +84,8 @@ def prepare_models(
 
     return {
         "status": "ok",
-        "workspace_dir": str(package_root()),
+        "workspace_dir": str(workspace_root()),
+        "package_dir": str(package_root()),
         "steps": steps,
     }
 

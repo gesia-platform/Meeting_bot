@@ -175,6 +175,39 @@ class DelegateService:
         session.touch()
         return self._store.save_session(session)
 
+    def _set_user_progress(
+        self,
+        session: DelegateSession,
+        *,
+        stage: str,
+        message: str,
+        detail: str | None = None,
+    ) -> None:
+        session.ai_state["user_progress"] = {
+            "stage": str(stage or "").strip(),
+            "message": str(message or "").strip(),
+            "detail": str(detail or "").strip() or None,
+            "updated_at": utcnow_iso(),
+        }
+
+    def _persist_user_progress(
+        self,
+        session_id: str,
+        *,
+        stage: str,
+        message: str,
+        detail: str | None = None,
+    ) -> DelegateSession | None:
+        def _mutator(session: DelegateSession) -> None:
+            self._set_user_progress(
+                session,
+                stage=stage,
+                message=message,
+                detail=detail,
+            )
+
+        return self._store.mutate_session(session_id, _mutator)
+
     def _finalization_status(self, session: DelegateSession) -> str:
         return str(dict(session.ai_state.get("finalization") or {}).get("status") or "").strip().lower()
 
@@ -201,6 +234,20 @@ class DelegateService:
         session.join_ticket = {**session.join_ticket, **launch}
         session.status = "joining" if launch["status"] in {"browser_ready", "desktop_ready"} else "blocked"
         session.status_reason = launch["message"]
+        if session.status == "joining":
+            self._set_user_progress(
+                session,
+                stage="joining",
+                message="회의에 참가하고 있습니다.",
+                detail="브라우저에서 회의 입장을 준비하고 있습니다.",
+            )
+        else:
+            self._set_user_progress(
+                session,
+                stage="blocked",
+                message="회의를 시작하기 전에 확인이 필요합니다.",
+                detail=session.status_reason,
+            )
         saved = self.persist_session(session)
         await self._maybe_prime_ai_thread(saved)
         return saved, launch
@@ -1512,6 +1559,13 @@ class DelegateService:
         session = self._require_session(session_id)
         if session.status == "completed":
             return session
+        self._set_user_progress(
+            session,
+            stage="meeting_ended",
+            message="회의 종료를 확인했습니다.",
+            detail="이제 결과물을 준비합니다.",
+        )
+        session = self.persist_session(session)
         await self.stop_audio_observer(session_id)
         session = self._require_session(session_id)
         latest_archive_at = self._latest_audio_archive_at(session)
@@ -1535,6 +1589,13 @@ class DelegateService:
             return session
 
         if latest_archive_at:
+            self._set_user_progress(
+                session,
+                stage="audio_finalize",
+                message="수집한 음성을 정리하고 있습니다.",
+                detail="회의 내용을 더 정확하게 정리하기 위한 마지막 확인 단계입니다.",
+            )
+            session = self.persist_session(session)
             try:
                 session = await self._refresh_transcript_from_audio_archive(session)
             except Exception as exc:
@@ -1557,6 +1618,12 @@ class DelegateService:
                     session.action_items = []
                     session.summary_exports = []
                     session.transcript_exports = []
+                    self._set_user_progress(
+                        session,
+                        stage="export_failed",
+                        message="회의 내용을 정리할 수 없었습니다.",
+                        detail="수집된 회의 내용이 충분하지 않았습니다.",
+                    )
                     return self.persist_session(session)
                 session.status_reason = (
                     "Final offline transcription failed, so the exported summary used the current live meeting capture. "
@@ -1579,11 +1646,31 @@ class DelegateService:
         if str(session.ai_state.get("final_transcription", {}).get("status") or "").strip().lower() == "success":
             session.status_reason = None
         session.summary_packet = self._summary_pipeline.build(session)
+        self._set_user_progress(
+            session,
+            stage="summarizing",
+            message="핵심 논의를 요약하고 있습니다.",
+            detail="회의 내용을 읽기 쉬운 형태로 정리하고 있습니다.",
+        )
+        session = self.persist_session(session)
         ai_result = await self._ai.summarize_session(session)
+        self._set_user_progress(
+            session,
+            stage="result_preparation",
+            message="결과물 구성을 정리하고 있습니다.",
+            detail="문서 구조와 필요한 시각 요소를 준비하고 있습니다.",
+        )
+        session = self.persist_session(session)
         ai_result = await self._ai.materialize_result_generation(
             session,
             ai_result,
             output_dir=self._export_dir / session.session_id,
+            progress_callback=lambda stage, message, detail=None: self._persist_user_progress(
+                session.session_id,
+                stage=stage,
+                message=message,
+                detail=detail,
+            ),
         )
         session.summary = str(ai_result.get("summary") or "").strip()
         session.action_items = [str(item).strip() for item in ai_result.get("action_items", []) if str(item).strip()]
@@ -1593,7 +1680,28 @@ class DelegateService:
         if ai_result.get("provider"):
             session.ai_state["last_provider"] = str(ai_result["provider"])
         session.ai_state["last_summary_at"] = utcnow_iso()
+        self._set_user_progress(
+            session,
+            stage="exporting_pdf",
+            message="PDF 결과물을 마무리하고 있습니다.",
+            detail="마지막 형식을 정리하고 있습니다.",
+        )
+        session = self.persist_session(session)
         self._write_exports(session)
+        if str(session.ai_state.get("artifact_export_error") or "").strip():
+            self._set_user_progress(
+                session,
+                stage="export_failed",
+                message="결과물을 마무리하는 중 문제가 생겼습니다.",
+                detail="잠시 후 다시 확인해 주세요.",
+            )
+        else:
+            self._set_user_progress(
+                session,
+                stage="completed",
+                message="결과물이 준비되었습니다.",
+                detail="이제 결과물을 확인하실 수 있습니다.",
+            )
         return self.persist_session(session)
 
     async def request_session_completion(
@@ -1671,6 +1779,12 @@ class DelegateService:
                     )
                 )
             queue_status = "processing" if job.status == "leased" else "queued"
+            self._set_user_progress(
+                session,
+                stage="meeting_ended",
+                message="회의 종료를 확인했습니다.",
+                detail="이제 결과물을 준비합니다.",
+            )
             self._update_finalization_state(
                 session,
                 status=queue_status,
@@ -2019,6 +2133,24 @@ class DelegateService:
             }
         )
         session.ai_state["meeting_end_watch"] = watch_state
+        current_progress = dict(session.ai_state.get("user_progress") or {})
+        current_stage = str(current_progress.get("stage") or "").strip().lower()
+        if current_stage not in {
+            "meeting_ended",
+            "audio_finalize",
+            "summarizing",
+            "result_preparation",
+            "generating_images",
+            "exporting_pdf",
+            "completed",
+            "export_failed",
+        }:
+            self._set_user_progress(
+                session,
+                stage="capturing",
+                message="회의 음성을 수집하고 있습니다.",
+                detail="회의가 끝나면 자동으로 결과물을 준비합니다.",
+            )
 
     def _mark_session_suspected_ended(
         self,
@@ -2046,6 +2178,12 @@ class DelegateService:
             }
         )
         session.ai_state["meeting_end_watch"] = watch_state
+        self._set_user_progress(
+            session,
+            stage="ending_check",
+            message="회의 종료를 확인하고 있습니다.",
+            detail="회의가 끝난 것으로 보이면 결과물 준비를 시작합니다.",
+        )
         session.status = "suspected_ended"
         session.status_reason = str(snapshot.get("reason") or "Waiting for the meeting-end watchdog grace window.")
 

@@ -20,6 +20,7 @@ from local_meeting_ai_runtime.assets import (
 from .config import DEFAULT_WHISPER_CPP_MODEL_NAME
 from .cuda_support import build_torch_cuda_install_commands, detect_cuda_gpu, inspect_torch_runtime, torch_cuda_index_url
 from .model_manager import prepare_models
+from .paths import package_root, resolve_relative_path, workspace_root
 from .platform_support import (
     MACOS,
     ToolInstallPlan,
@@ -29,9 +30,6 @@ from .platform_support import (
     editable_install_target,
     tool_install_plans,
 )
-
-
-PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 
 
 def run_setup(
@@ -135,16 +133,17 @@ def run_setup(
 
     return {
         "status": "ok",
-        "workspace_dir": str(PACKAGE_ROOT),
+        "workspace_dir": str(workspace_root()),
+        "package_dir": str(package_root()),
         "steps": steps,
     }
 
 
 def _ensure_default_directories() -> list[Path]:
     targets = [
-        PACKAGE_ROOT / "data" / "exports",
-        PACKAGE_ROOT / "data" / "audio",
-        PACKAGE_ROOT / ".tmp" / "zoom-meeting-bot",
+        workspace_root() / "data" / "exports",
+        workspace_root() / "data" / "audio",
+        workspace_root() / ".tmp" / "zoom-meeting-bot",
     ]
     for target in targets:
         target.mkdir(parents=True, exist_ok=True)
@@ -298,7 +297,7 @@ def _run(command: list[str], *, step_name: str, steps: list[dict[str, Any]]) -> 
     print(f"[setup] running: {' '.join(command)}")
     process = subprocess.run(
         command,
-        cwd=str(PACKAGE_ROOT),
+        cwd=str(package_root()),
         check=False,
     )
     if process.returncode != 0:
@@ -315,7 +314,7 @@ def _run(command: list[str], *, step_name: str, steps: list[dict[str, Any]]) -> 
 def _prepare_whisper_cpp_runtime_assets(*, config: dict[str, Any], steps: list[dict[str, Any]]) -> None:
     local_ai = dict(config.get("local_ai") or {})
     model_name = _derive_whisper_cpp_model_name(str(local_ai.get("whisper_cpp_model") or ""))
-    _ensure_bundled_whisper_cpp_model_available(model_name=model_name, steps=steps)
+    bundled_root = next((candidate for candidate in bundled_whisper_cpp_roots() if candidate.exists()), None)
 
     try:
         payload = prepare_whisper_cpp_assets(
@@ -340,37 +339,51 @@ def _prepare_whisper_cpp_runtime_assets(*, config: dict[str, Any], steps: list[d
         )
         return
     except (FileNotFoundError, RuntimeError):
+        bundled_payload = _prepare_whisper_cpp_assets_from_bundled_runtime(
+            bundled_root=bundled_root,
+            model_name=model_name,
+            steps=steps,
+        )
+        if bundled_payload is not None:
+            steps.append(bundled_payload)
+            return
         if current_platform_id() == MACOS:
             system_payload = _prepare_whisper_cpp_assets_from_system_install(
                 config=config,
                 model_name=model_name,
+                bundled_root=bundled_root,
+                steps=steps,
             )
             if system_payload is not None:
                 steps.append(system_payload)
                 return
-            _build_bundled_whisper_cpp_for_macos(steps=steps)
-            payload = prepare_whisper_cpp_assets(
-                model_name=model_name,
-                overwrite=False,
+            if _bundled_whisper_cpp_source_tree_available(bundled_root):
+                _build_bundled_whisper_cpp_for_macos(steps=steps)
+                payload = prepare_whisper_cpp_assets(
+                    model_name=model_name,
+                    overwrite=False,
+                )
+                status = whisper_cpp_asset_status(model_name=model_name)
+                if not bool(status.get("ready")):
+                    raise RuntimeError("whisper.cpp assets are still not ready after macOS build and preparation.")
+                steps.append(
+                    {
+                        "step": "whisper_cpp_assets",
+                        "status": "ok",
+                        "model_name": model_name,
+                        "asset_root": status.get("asset_root"),
+                        "copied_count": len(payload.get("copied") or []),
+                        "existing_count": len(payload.get("existing") or []),
+                        "external_asset_root_ready": bool(status.get("external_asset_root_ready")),
+                        "whisper_cli_path": status.get("whisper_cli_path"),
+                        "model_path": status.get("model_path"),
+                        "detail": "Prepared whisper.cpp runtime assets from a macOS-local build.",
+                    }
+                )
+                return
+            raise RuntimeError(
+                "whisper.cpp CLI is unavailable. Install `whisper-cpp` first or configure explicit whisper.cpp paths."
             )
-            status = whisper_cpp_asset_status(model_name=model_name)
-            if not bool(status.get("ready")):
-                raise RuntimeError("whisper.cpp assets are still not ready after macOS build and preparation.")
-            steps.append(
-                {
-                    "step": "whisper_cpp_assets",
-                    "status": "ok",
-                    "model_name": model_name,
-                    "asset_root": status.get("asset_root"),
-                    "copied_count": len(payload.get("copied") or []),
-                    "existing_count": len(payload.get("existing") or []),
-                    "external_asset_root_ready": bool(status.get("external_asset_root_ready")),
-                    "whisper_cli_path": status.get("whisper_cli_path"),
-                    "model_path": status.get("model_path"),
-                    "detail": "Prepared whisper.cpp runtime assets from a macOS-local build.",
-                }
-            )
-            return
 
     configured_command = _resolve_optional_path(str(local_ai.get("whisper_cpp_command") or ""))
     configured_model = _resolve_optional_path(str(local_ai.get("whisper_cpp_model") or ""))
@@ -389,6 +402,20 @@ def _prepare_whisper_cpp_runtime_assets(*, config: dict[str, Any], steps: list[d
         )
         return
 
+    if bundled_root is None:
+        steps.append(
+            {
+                "step": "whisper_cpp_assets",
+                "status": "warning",
+                "model_name": model_name,
+                "detail": (
+                    "Bundled whisper.cpp assets are not included in this package, so the local whisper.cpp "
+                    "fallback was skipped. Configure explicit whisper.cpp paths later if you need that path."
+                ),
+            }
+        )
+        return
+
     raise RuntimeError(
         "whisper.cpp runtime assets are unavailable. Restore tools/whisper.cpp or configure explicit whisper.cpp paths."
     )
@@ -398,6 +425,8 @@ def _prepare_whisper_cpp_assets_from_system_install(
     *,
     config: dict[str, Any],
     model_name: str,
+    bundled_root: Path | None,
+    steps: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     system_cli = _resolve_optional_path("whisper-cli")
     if system_cli is None or not system_cli.is_file():
@@ -410,20 +439,26 @@ def _prepare_whisper_cpp_assets_from_system_install(
         discovered_model = find_whisper_cpp_model(model_name)
         if discovered_model is not None:
             model_source = discovered_model
-    if model_source is None or not model_source.is_file():
-        return None
 
     resolved_asset_root = whisper_cpp_asset_root()
     copied_count = 0
     existing_count = 0
 
-    model_destination = resolved_asset_root / "models" / model_source.name
-    if _copy_optional_asset(model_source, model_destination):
-        copied_count += 1
+    model_destination: Path | None = None
+    if model_source is not None and model_source.is_file():
+        model_destination = resolved_asset_root / "models" / model_source.name
+        if _copy_optional_asset(model_source, model_destination):
+            copied_count += 1
+        else:
+            existing_count += 1
     else:
-        existing_count += 1
+        model_destination = _ensure_whisper_cpp_model_in_asset_root(
+            model_name=model_name,
+            bundled_root=bundled_root,
+            steps=steps,
+        )
 
-    vad_source = find_whisper_cpp_vad_model(preferred_model_path=str(model_source))
+    vad_source = find_whisper_cpp_vad_model(preferred_model_path=str(model_destination or model_source or ""))
     if vad_source is not None:
         vad_destination = resolved_asset_root / "models" / vad_source.name
         if _copy_optional_asset(vad_source, vad_destination):
@@ -431,7 +466,9 @@ def _prepare_whisper_cpp_assets_from_system_install(
         else:
             existing_count += 1
 
-    resolved_model = model_destination if model_destination.exists() else model_source
+    resolved_model = model_destination if model_destination and model_destination.exists() else model_source
+    if resolved_model is None:
+        return None
     return {
         "step": "whisper_cpp_assets",
         "status": "ok",
@@ -530,29 +567,106 @@ def _build_bundled_whisper_cpp_for_macos(*, steps: list[dict[str, Any]]) -> None
     )
 
 
-def _ensure_bundled_whisper_cpp_model_available(*, model_name: str, steps: list[dict[str, Any]]) -> None:
-    root = next((candidate for candidate in bundled_whisper_cpp_roots() if candidate.exists()), None)
-    if root is None:
-        return
-    model_path = _bundled_whisper_cpp_model_path(root=root, model_name=model_name)
-    if model_path is not None:
+def _prepare_whisper_cpp_assets_from_bundled_runtime(
+    *,
+    bundled_root: Path | None,
+    model_name: str,
+    steps: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if bundled_root is None:
+        return None
+    cli_source = _find_bundled_whisper_cpp_cli_source(bundled_root)
+    if cli_source is None:
+        return None
+
+    model_path = _ensure_whisper_cpp_model_in_asset_root(
+        model_name=model_name,
+        bundled_root=bundled_root,
+        steps=steps,
+    )
+
+    resolved_asset_root = whisper_cpp_asset_root()
+    copied_count = 0
+    existing_count = 0
+
+    cli_destination = resolved_asset_root / "bin" / cli_source.name
+    if _copy_optional_asset(cli_source, cli_destination, executable=not cli_source.name.endswith(".exe")):
+        copied_count += 1
+    else:
+        existing_count += 1
+
+    for sidecar in _whisper_cpp_runtime_sidecars(cli_source):
+        destination = resolved_asset_root / "bin" / sidecar.name
+        if _copy_optional_asset(sidecar, destination):
+            copied_count += 1
+        else:
+            existing_count += 1
+
+    status = whisper_cpp_asset_status(model_name=model_name)
+    if not bool(status.get("ready")):
+        raise RuntimeError("whisper.cpp bundled CLI assets were copied, but the runtime assets are still not ready.")
+
+    return {
+        "step": "whisper_cpp_assets",
+        "status": "ok",
+        "model_name": model_name,
+        "asset_root": str(resolved_asset_root),
+        "copied_count": copied_count,
+        "existing_count": existing_count,
+        "external_asset_root_ready": bool(status.get("external_asset_root_ready")),
+        "whisper_cli_path": status.get("whisper_cli_path"),
+        "model_path": str(model_path),
+        "detail": "Prepared whisper.cpp runtime assets from the bundled CLI assets and automatic model download.",
+    }
+
+
+def _ensure_whisper_cpp_model_in_asset_root(
+    *,
+    model_name: str,
+    bundled_root: Path | None,
+    steps: list[dict[str, Any]],
+) -> Path:
+    resolved_asset_root = whisper_cpp_asset_root()
+    asset_model_path = resolved_asset_root / "models" / f"ggml-{model_name}.bin"
+    if asset_model_path.exists():
         steps.append(
             {
                 "step": "whisper_cpp_model_download",
                 "status": "ok",
-                "detail": f"Bundled whisper.cpp model `{model_name}` is already present.",
-                "model_path": str(model_path),
+                "detail": f"whisper.cpp model `{model_name}` is already present in the external asset root.",
+                "model_path": str(asset_model_path),
             }
         )
-        return
+        return asset_model_path
 
-    script_path = root / "models" / ("download-ggml-model.cmd" if os.name == "nt" else "download-ggml-model.sh")
+    discovered_model = find_whisper_cpp_model(model_name)
+    if discovered_model is not None and discovered_model.is_file():
+        if _copy_optional_asset(discovered_model, asset_model_path):
+            detail = f"Copied whisper.cpp model `{model_name}` into the external asset root."
+        else:
+            detail = f"whisper.cpp model `{model_name}` was already available for the external asset root."
+        steps.append(
+            {
+                "step": "whisper_cpp_model_download",
+                "status": "ok",
+                "detail": detail,
+                "model_path": str(asset_model_path if asset_model_path.exists() else discovered_model),
+            }
+        )
+        return asset_model_path if asset_model_path.exists() else discovered_model
+
+    if bundled_root is None:
+        raise RuntimeError(
+            f"whisper.cpp model `{model_name}` is unavailable and no bundled download script was found."
+        )
+
+    script_path = bundled_root / "models" / ("download-ggml-model.cmd" if os.name == "nt" else "download-ggml-model.sh")
     if not script_path.exists():
         raise RuntimeError(
             f"Bundled whisper.cpp download script is missing, so `{model_name}` cannot be prepared automatically: {script_path}"
         )
 
-    models_dir = root / "models"
+    models_dir = resolved_asset_root / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":
         command = ["cmd", "/c", str(script_path), model_name, str(models_dir)]
@@ -561,8 +675,7 @@ def _ensure_bundled_whisper_cpp_model_available(*, model_name: str, steps: list[
         command = [bash_path, str(script_path), model_name, str(models_dir)]
     _run(command, step_name="whisper_cpp_model_download_exec", steps=steps)
 
-    downloaded_model = _bundled_whisper_cpp_model_path(root=root, model_name=model_name)
-    if downloaded_model is None:
+    if not asset_model_path.exists():
         raise RuntimeError(
             f"whisper.cpp model `{model_name}` download completed, but `ggml-{model_name}.bin` was not found in {models_dir}."
         )
@@ -570,10 +683,60 @@ def _ensure_bundled_whisper_cpp_model_available(*, model_name: str, steps: list[
         {
             "step": "whisper_cpp_model_download",
             "status": "ok",
-            "detail": f"Downloaded bundled whisper.cpp model `{model_name}`.",
-            "model_path": str(downloaded_model),
+            "detail": f"Downloaded whisper.cpp model `{model_name}` into the external asset root.",
+            "model_path": str(asset_model_path),
         }
     )
+    return asset_model_path
+
+
+def _find_bundled_whisper_cpp_cli_source(root: Path) -> Path | None:
+    if sys.platform.startswith("win"):
+        candidates = (
+            root / "build" / "bin" / "Release" / "whisper-cli.exe",
+            root / "bin" / "whisper-cli.exe",
+            root / "build" / "bin" / "whisper-cli.exe",
+        )
+    else:
+        candidates = (
+            root / "build-macos" / "bin" / "whisper-cli",
+            root / "build" / "bin" / "Release" / "whisper-cli",
+            root / "build" / "bin" / "whisper-cli",
+            root / "bin" / "whisper-cli",
+        )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def _whisper_cpp_runtime_sidecars(cli_source: Path) -> list[Path]:
+    source_dir = cli_source.parent
+    if sys.platform.startswith("win"):
+        patterns = ("*.dll",)
+    elif sys.platform == "darwin":
+        patterns = ("*.dylib", "*.so", "*.so.*")
+    else:
+        patterns = ("*.so", "*.so.*")
+
+    matches: list[Path] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for candidate in source_dir.glob(pattern):
+            resolved = candidate.resolve()
+            key = str(resolved).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append(resolved)
+    matches.sort(key=lambda path: path.name.lower())
+    return matches
+
+
+def _bundled_whisper_cpp_source_tree_available(root: Path | None) -> bool:
+    if root is None:
+        return False
+    return (root / "CMakeLists.txt").exists() and (root / "src").exists()
 
 
 def _bundled_whisper_cpp_model_path(*, root: Path, model_name: str) -> Path | None:
@@ -605,7 +768,7 @@ def _resolve_optional_path(value: str) -> Path | None:
     if path.is_absolute():
         return path.resolve()
     if "/" in text or "\\" in text:
-        return (PACKAGE_ROOT / path).resolve()
+        return resolve_relative_path(path)
     resolved = shutil.which(text)
     if resolved:
         return Path(resolved).resolve()

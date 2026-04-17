@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +20,7 @@ from local_meeting_ai_runtime.meeting_output_skill import (
 )
 
 from .config import write_config
-from .runtime_env import package_root, resolve_workspace_path
+from .paths import resolve_relative_path, resolve_workspace_path, workspace_root
 
 
 COMPOSE_SANDBOX_ROOT = Path(tempfile.gettempdir()) / "zoom-meeting-bot" / "skill-compose"
@@ -35,17 +37,55 @@ class SkillAsset:
     is_active: bool = False
 
 
+_RESULT_STYLE_LABELS = {
+    "executive_summary": "회의 전체 요약",
+    "sections": "핵심 논의 주제",
+    "decisions": "결정사항",
+    "action_items": "액션 아이템",
+    "open_questions": "열린 질문",
+    "risk_signals": "리스크 신호",
+    "memo": "메모",
+    "postprocess_requests": "추가 결과물 제안",
+}
+
+_COMPOSE_REPLY_SKIP_PREFIXES = (
+    "sources:",
+    "source:",
+    "brand cues were",
+    "i couldn't run",
+    "i could not run",
+    "for more information",
+    "to learn more",
+)
+
+
 def resolve_codex_command(config: dict[str, Any]) -> str:
     local_ai = dict(config.get("local_ai") or {})
     raw = str(local_ai.get("codex_command") or "codex").strip() or "codex"
     candidate = Path(raw).expanduser()
     if candidate.is_absolute() and candidate.exists():
+        if sys.platform.startswith("win") and candidate.suffix.lower() == ".cmd":
+            direct_candidate = candidate.with_suffix(".exe")
+            if direct_candidate.exists():
+                return str(direct_candidate.resolve())
         return str(candidate.resolve())
     if any(separator in raw for separator in ("/", "\\")):
-        workspace_candidate = resolve_workspace_path(raw)
+        workspace_candidate = resolve_relative_path(raw)
         if workspace_candidate.exists():
+            if sys.platform.startswith("win") and workspace_candidate.suffix.lower() == ".cmd":
+                direct_candidate = workspace_candidate.with_suffix(".exe")
+                if direct_candidate.exists():
+                    return str(direct_candidate.resolve())
             return str(workspace_candidate)
+    if sys.platform.startswith("win") and raw.casefold() in {"codex", "codex.cmd"}:
+        direct_discovered = shutil.which("codex.exe")
+        if direct_discovered:
+            return str(Path(direct_discovered).resolve())
     discovered = shutil.which(raw)
+    if sys.platform.startswith("win") and discovered and discovered.lower().endswith(".cmd"):
+        direct_candidate = Path(discovered).with_suffix(".exe")
+        if direct_candidate.exists():
+            return str(direct_candidate.resolve())
     return discovered or ""
 
 
@@ -211,9 +251,13 @@ def build_skill_compose_turn_prompt() -> str:
         "Treat `SKILL.md` as the current editable draft and update only that file when needed.\n"
         "Read `USER_MESSAGE.md` for the newest user request and `CONVERSATION.md` for the chat so far.\n"
         "Respond in Korean.\n"
+        "Your user-facing reply must be Korean-only.\n"
+        "Do not output English status text, validator chatter, tool diagnostics, repo notes, source lists, markdown links, or implementation commentary in the user-facing reply.\n"
+        "When the request is clear, do not stay overly generic or timid; reflect the user's style direction confidently in concrete renderer metadata and body guidance.\n"
+        "Prefer a well-shaped, specific override over a minimal safe placeholder when the user has already given enough direction.\n"
         "Do not invent a default style when the user has already expressed a preference.\n"
-        "If the request is clear enough, update `SKILL.md` immediately and reply with a short confirmation of what changed.\n"
-        "If something is truly ambiguous and blocks a good draft, ask exactly one short follow-up question.\n"
+        "If the request is clear enough, update `SKILL.md` immediately and reply with `READY: ` followed by one short Korean confirmation sentence.\n"
+        "If something is truly ambiguous and blocks a good draft, ask exactly one short follow-up question and format it as `QUESTION: ` followed by that one Korean question.\n"
         "Do not mention internal implementation details, repository structure, hidden files, frontmatter, metadata, slot names, or JSON field names unless the user explicitly asks.\n"
         "Talk to the user only in terms of the final result they want to see.\n"
         "The only user-facing asset from this conversation is the final `SKILL.md`; do not suggest sidecar JSON, helper Markdown, or extra persistent files.\n"
@@ -229,7 +273,7 @@ def build_skill_compose_turn_prompt() -> str:
         "If the user wants images, appendix-style outputs, or renderer polish, describe that as result post-processing and concrete document-surface guidance in the draft rather than changing the engine itself.\n"
         "If the user mentions a company, brand, or visual mood, capture that in the draft as renderer theme guidance and, when appropriate, color direction.\n"
         "Prefer soft guidance over fixed page counts, sentence quotas, or rigid per-block caps unless the user explicitly insists on a hard constraint.\n"
-        "At the end of your response, briefly tell the user whether the draft is ready or what one clarification you still need.\n"
+        "Your user-facing reply should be at most two short Korean sentences total.\n"
     )
 
 
@@ -247,13 +291,10 @@ def run_skill_compose_turn(
         "exec",
         "--skip-git-repo-check",
         "--ephemeral",
-        "--search",
         "--color",
         "never",
         "-s",
         "workspace-write",
-        "-a",
-        "never",
         "-C",
         str(workspace_dir),
         "-o",
@@ -301,6 +342,89 @@ def finalize_composed_skill(
         metadata=dict(loaded.get("metadata") or {}),
         body=body,
     )
+
+
+def interpret_skill_compose_reply(reply_text: str) -> dict[str, str]:
+    text = str(reply_text or "").strip()
+    kind = "ready"
+    if text.upper().startswith("QUESTION:"):
+        kind = "question"
+        text = text.split(":", 1)[1].strip()
+    elif text.upper().startswith("READY:"):
+        text = text.split(":", 1)[1].strip()
+    text = _sanitize_skill_compose_reply(text)
+    if _looks_like_unfriendly_compose_reply(text):
+        text = ""
+    if not text:
+        text = (
+            "추가로 꼭 확인해야 할 점이 있으면 한 줄로 말씀해 주세요."
+            if kind == "question"
+            else "요청을 반영한 결과물 스타일 초안을 업데이트했습니다."
+        )
+    if kind != "question" and text.endswith("?") and len(text) <= 120:
+        kind = "question"
+    return {
+        "kind": kind,
+        "text": text,
+    }
+
+
+def summarize_composed_skill_for_user(skill_path: Path) -> str:
+    loaded = load_meeting_output_skill(skill_path)
+    metadata = dict(loaded.get("metadata") or {})
+    name = str(loaded.get("name") or "").strip() or skill_path.parent.name
+
+    lines = [
+        "결과물 스타일 초안을 저장했습니다.",
+        f"- 스타일 이름: {name}",
+    ]
+
+    theme_name = str(metadata.get("renderer_theme_name") or "").strip()
+    fonts = [
+        str(metadata.get("renderer_title_font") or "").strip(),
+        str(metadata.get("renderer_heading_font") or "").strip(),
+        str(metadata.get("renderer_body_font") or "").strip(),
+    ]
+    fonts = [font for font in fonts if font]
+    colors = [
+        str(metadata.get("renderer_primary_color") or "").strip(),
+        str(metadata.get("renderer_accent_color") or "").strip(),
+        str(metadata.get("renderer_neutral_color") or "").strip(),
+    ]
+    colors = [color for color in colors if color]
+
+    if theme_name:
+        lines.append(f"- 분위기 방향: {theme_name}")
+    if colors:
+        lines.append(f"- 색감 단서: {', '.join(colors[:3])}")
+    if fonts:
+        unique_fonts = list(dict.fromkeys(fonts))
+        lines.append(f"- 폰트 방향: {', '.join(unique_fonts)}")
+
+    block_order = [
+        _RESULT_STYLE_LABELS.get(item.strip(), item.strip())
+        for item in str(metadata.get("result_block_order") or "").split(",")
+        if item.strip()
+    ]
+    if block_order:
+        lines.append(f"- 주요 구성 순서: {', '.join(block_order[:4])}")
+
+    hidden_blocks = []
+    for key, label in (
+        ("show_risk_signals", "리스크 신호"),
+        ("show_memo", "메모"),
+        ("show_postprocess_requests", "이미지/추가 결과물 제안"),
+    ):
+        if str(metadata.get(key) or "").strip().lower() == "never":
+            hidden_blocks.append(label)
+    if hidden_blocks:
+        lines.append(f"- 결과물에서 숨김: {', '.join(hidden_blocks)}")
+
+    description = str(loaded.get("description") or "").strip()
+    if description:
+        lines.append(f"- 한 줄 설명: {description}")
+
+    return "\n".join(lines)
 
 
 def activate_meeting_output_override(
@@ -429,9 +553,41 @@ def _pick_compose_reply_fallback(stdout: str, stderr: str) -> str:
     return ""
 
 
+def _sanitize_skill_compose_reply(text: str) -> str:
+    cleaned_lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lower = line.casefold()
+        if any(lower.startswith(prefix) for prefix in _COMPOSE_REPLY_SKIP_PREFIXES):
+            continue
+        if "validator" in lower or "sanity check" in lower:
+            continue
+        if line.startswith("[") and "](" in line:
+            continue
+        line = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", line)
+        cleaned_lines.append(line)
+    if not cleaned_lines:
+        return ""
+    merged = " ".join(cleaned_lines)
+    return re.sub(r"\s+", " ", merged).strip()
+
+
+def _looks_like_unfriendly_compose_reply(text: str) -> bool:
+    candidate = str(text or "").strip()
+    if not candidate:
+        return False
+    if re.search(r"https?://|www\.", candidate, re.IGNORECASE):
+        return True
+    has_hangul = bool(re.search(r"[가-힣]", candidate))
+    has_english_words = bool(re.search(r"[A-Za-z]{4,}", candidate))
+    return has_english_words and not has_hangul
+
+
 def _to_workspace_relative(path: Path) -> str:
     resolved = path.resolve()
-    root = package_root().resolve()
+    root = workspace_root().resolve()
     try:
         return str(resolved.relative_to(root)).replace("\\", "/")
     except ValueError:

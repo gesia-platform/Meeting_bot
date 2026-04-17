@@ -1,0 +1,34 @@
+{
+  "name": "zoom-meeting-bot",
+  "version": "0.1.0",
+  "description": "Global npm launcher for the Zoom Meeting Bot CLI kit.",
+  "license": "UNLICENSED",
+  "bin": {
+    "zoom-meeting-bot": "bin/zoom-meeting-bot.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "README.md",
+    "bin",
+    "doc/templates",
+    "pyproject.toml",
+    "skills/meeting-output-default",
+    "src/**/*.py",
+    "tools/whisper.cpp/build/bin/Release",
+    "tools/whisper.cpp/models/download-ggml-model.cmd",
+    "tools/whisper.cpp/models/download-ggml-model.sh",
+    "tools/whisper.cpp/models/download-vad-model.cmd",
+    "tools/whisper.cpp/models/download-vad-model.sh",
+    "zoom-meeting-bot.config.example.json",
+    "zoom-meeting-bot.config.metheus.example.json"
+  ],
+  "keywords": [
+    "zoom",
+    "meeting",
+    "bot",
+    "cli",
+    "python"
+  ]
+}

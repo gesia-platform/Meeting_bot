@@ -51,6 +51,7 @@ def _iter_bundle_files(root: Path, *, include_notes: bool) -> list[Path]:
     files: list[Path] = []
     top_level_files = (
         "README.md",
+        "package.json",
         "pyproject.toml",
         "zoom-meeting-bot.config.example.json",
         "zoom-meeting-bot.config.metheus.example.json",
@@ -64,6 +65,10 @@ def _iter_bundle_files(root: Path, *, include_notes: bool) -> list[Path]:
         directory = root / relative_dir
         if directory.exists():
             files.extend(_walk_files(directory))
+
+    default_skill_dir = root / "skills" / "meeting-output-default"
+    if default_skill_dir.exists() and default_skill_dir.is_dir():
+        files.extend(_walk_files(default_skill_dir))
 
     if include_notes:
         notes_dir = root / "notes"

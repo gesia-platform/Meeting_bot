@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+tools/whisper.cpp/README.md
+tools/whisper.cpp/models/README.md

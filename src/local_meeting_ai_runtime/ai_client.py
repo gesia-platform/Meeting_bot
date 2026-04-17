@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Callable
 import wave
 import gc
 
@@ -225,6 +225,7 @@ class AiDelegateClient:
         ai_result: dict[str, Any],
         *,
         output_dir: str | Path,
+        progress_callback: Callable[[str, str, str | None], None] | None = None,
     ) -> dict[str, Any]:
         materialized = dict(ai_result or {})
         self._apply_resolved_renderer_theme(session)
@@ -243,6 +244,7 @@ class AiDelegateClient:
             output_dir=Path(output_dir),
             title=str(materialized.get("title") or "").strip(),
             context_result=materialized,
+            progress_callback=progress_callback,
         )
         materialized["postprocess_requests"] = resolved_requests
         return materialized
@@ -1370,6 +1372,7 @@ class AiDelegateClient:
         output_dir: Path,
         title: str,
         context_result: dict[str, Any],
+        progress_callback: Callable[[str, str, str | None], None] | None = None,
     ) -> list[dict[str, Any]]:
         visuals_dir = output_dir / "visuals"
         visuals_dir.mkdir(parents=True, exist_ok=True)
@@ -1378,6 +1381,15 @@ class AiDelegateClient:
         )
         materialized: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
+        image_request_total = len(
+            [
+                item
+                for item in requests
+                if str(item.get("kind") or "").strip().lower() == "image_brief"
+                and not str(item.get("image_path") or "").strip()
+            ]
+        )
+        image_request_index = 0
         for item in requests:
             image_path = str(item.get("image_path") or "").strip()
             count = self._coerce_positive_count(item.get("count"), default=1)
@@ -1388,6 +1400,17 @@ class AiDelegateClient:
             if not should_generate_image:
                 materialized.append(dict(item))
                 continue
+            image_request_index += 1
+            if progress_callback is not None:
+                title_text = str(item.get("title") or "").strip()
+                detail = f"{image_request_index}/{image_request_total}번째 이미지를 준비하고 있습니다."
+                if title_text:
+                    detail = f"{detail} ({title_text})"
+                progress_callback(
+                    "generating_images",
+                    "이미지를 만드는 중입니다.",
+                    detail,
+                )
             prepared_request = self._enrich_result_image_request(
                 session,
                 title=title,

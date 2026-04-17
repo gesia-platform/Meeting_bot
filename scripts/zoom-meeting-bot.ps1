@@ -6,6 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
+& chcp.com 65001 > $null
 [Console]::InputEncoding = $Utf8
 [Console]::OutputEncoding = $Utf8
 $OutputEncoding = $Utf8

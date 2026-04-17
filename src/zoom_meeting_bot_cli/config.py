@@ -7,9 +7,12 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from local_meeting_ai_runtime.assets import find_whisper_cpp_cli, find_whisper_cpp_model
+
+from .paths import package_root, workspace_root
+
 
 DEFAULT_CONFIG_FILENAME = "zoom-meeting-bot.config.json"
-PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WHISPER_CPP_MODEL_NAME = "large-v3-turbo-q5_0"
 
 PRESET_CHOICES = (
@@ -49,7 +52,7 @@ DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
         "generated_meeting_output_dir": "skills/generated",
     },
     "meeting_artifacts": {
-        "pdf_renderer": "docx",
+        "pdf_renderer": "html",
     },
     "telegram": {
         "enabled": False,
@@ -88,7 +91,7 @@ DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
 
 
 def default_config_path(base_dir: Path | None = None) -> Path:
-    root = base_dir or Path.cwd()
+    root = base_dir or workspace_root()
     return root / DEFAULT_CONFIG_FILENAME
 
 
@@ -180,6 +183,9 @@ def suggest_workspace_name(bot_name: str) -> str:
 
 
 def suggest_whisper_cpp_command() -> str:
+    discovered = find_whisper_cpp_cli()
+    if discovered is not None:
+        return str(discovered)
     if sys.platform.startswith("win"):
         candidates = (
             Path("tools/whisper.cpp/build/bin/Release/whisper-cli.exe"),
@@ -198,7 +204,7 @@ def suggest_whisper_cpp_command() -> str:
             Path("/usr/local/bin/whisper-cli"),
         )
     for relative in candidates:
-        candidate = relative if relative.is_absolute() else (PACKAGE_ROOT / relative)
+        candidate = relative if relative.is_absolute() else (package_root() / relative)
         if candidate.exists():
             return relative.as_posix()
     if sys.platform == "darwin":
@@ -208,6 +214,9 @@ def suggest_whisper_cpp_command() -> str:
 
 def suggest_whisper_cpp_model(model_name: str = DEFAULT_WHISPER_CPP_MODEL_NAME) -> str:
     preferred = str(model_name or "").strip() or DEFAULT_WHISPER_CPP_MODEL_NAME
+    discovered = find_whisper_cpp_model(preferred)
+    if discovered is not None:
+        return str(discovered)
     candidates = (
         Path(f"tools/whisper.cpp/models/ggml-{preferred}.bin"),
         Path(f"tools/whisper.cpp/ggml-{preferred}.bin"),
@@ -215,7 +224,7 @@ def suggest_whisper_cpp_model(model_name: str = DEFAULT_WHISPER_CPP_MODEL_NAME) 
         Path("tools/whisper.cpp/ggml-base.bin"),
     )
     for relative in candidates:
-        if (PACKAGE_ROOT / relative).exists():
+        if (package_root() / relative).exists():
             return relative.as_posix()
     return ""
 

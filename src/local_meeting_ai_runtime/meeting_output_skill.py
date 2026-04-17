@@ -5,9 +5,9 @@ from datetime import datetime
 import re
 from pathlib import Path
 
+from zoom_meeting_bot_cli.paths import package_root, resolve_package_path, resolve_workspace_path
 
-PACKAGE_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MEETING_OUTPUT_SKILL_PATH = PACKAGE_ROOT / "skills" / "meeting-output-default" / "SKILL.md"
+DEFAULT_MEETING_OUTPUT_SKILL_PATH = package_root() / "skills" / "meeting-output-default" / "SKILL.md"
 DEFAULT_RESULT_BLOCK_ORDER = [
     "overview",
     "executive_summary",
@@ -223,12 +223,7 @@ DEFAULT_EMPTY_MESSAGES = {
 def resolve_meeting_output_skill_path(configured_path: str | Path | None = None) -> Path:
     text = str(configured_path or "").strip()
     if text:
-        path = Path(text).expanduser()
-        if not path.is_absolute():
-            path = (PACKAGE_ROOT / path).resolve()
-        else:
-            path = path.resolve()
-        return path
+        return resolve_package_path(text)
     return DEFAULT_MEETING_OUTPUT_SKILL_PATH.resolve()
 
 
@@ -263,13 +258,8 @@ def load_meeting_output_skill(configured_path: str | Path | None = None) -> dict
 def resolve_generated_meeting_output_dir(configured_path: str | Path | None = None) -> Path:
     text = str(configured_path or "").strip()
     if text:
-        path = Path(text).expanduser()
-        if not path.is_absolute():
-            path = (PACKAGE_ROOT / path).resolve()
-        else:
-            path = path.resolve()
-        return path
-    return (PACKAGE_ROOT / "skills" / "generated").resolve()
+        return resolve_workspace_path(text)
+    return resolve_workspace_path("skills/generated")
 
 
 def build_generated_meeting_output_skill_path(

@@ -7,10 +7,7 @@ from typing import Any
 from local_meeting_ai_runtime.assets import find_whisper_cpp_model
 
 from .config import DEFAULT_WHISPER_CPP_MODEL_NAME
-
-
-def package_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+from .paths import WORKSPACE_ROOT_ENV, package_root, resolve_package_path, resolve_relative_path, resolve_workspace_path, workspace_root
 
 
 def runtime_host(config: dict[str, Any]) -> str:
@@ -32,18 +29,11 @@ def runtime_state_path(config: dict[str, Any]) -> Path:
     configured = str(runtime.get("state_path") or ".tmp/zoom-meeting-bot/runtime-state.json").strip()
     return resolve_workspace_path(configured)
 
-
-def resolve_workspace_path(value: str) -> Path:
-    path = Path(value)
-    if path.is_absolute():
-        return path
-    return (package_root() / path).resolve()
-
-
 def build_runtime_env(config: dict[str, Any]) -> dict[str, str]:
     env = dict(os.environ)
     src_root = package_root() / "src"
     _augment_macos_homebrew_path(env)
+    env[WORKSPACE_ROOT_ENV] = str(workspace_root())
     current_pythonpath = env.get("PYTHONPATH", "").strip()
     pythonpath_parts = [str(src_root)]
     if current_pythonpath:
@@ -68,7 +58,7 @@ def build_runtime_env(config: dict[str, Any]) -> dict[str, str]:
     _set(
         env,
         "DELEGATE_MEETING_OUTPUT_SKILL_PATH",
-        str(resolve_workspace_path(str(skills.get("meeting_output_path") or "skills/meeting-output-default/SKILL.md"))),
+        str(resolve_package_path(str(skills.get("meeting_output_path") or "skills/meeting-output-default/SKILL.md"))),
     )
     override_skill_path = str(skills.get("meeting_output_override_path") or "").strip()
     if override_skill_path:
@@ -90,7 +80,7 @@ def build_runtime_env(config: dict[str, Any]) -> dict[str, str]:
     _set(
         env,
         "DELEGATE_MEETING_ARTIFACT_PDF_RENDERER",
-        str(meeting_artifacts.get("pdf_renderer") or "docx").strip(),
+        str(meeting_artifacts.get("pdf_renderer") or "html").strip(),
     )
     _set(env, "DELEGATE_BOT_DISPLAY_NAME", str(profile.get("bot_name") or "").strip())
     _set(env, "DELEGATE_LOCAL_USER_SPEAKER_NAME", str(profile.get("bot_name") or "").strip())
@@ -172,20 +162,14 @@ def _resolve_command_or_path(value: str) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
-    path = Path(text).expanduser()
-    if path.is_absolute():
-        return str(path.resolve())
     if "/" in text or "\\" in text:
-        return str(resolve_workspace_path(text))
+        return str(resolve_relative_path(text))
     return text
 
 
 def _resolve_file_path(value: str) -> Path:
     text = str(value or "").strip()
-    path = Path(text).expanduser()
-    if path.is_absolute():
-        return path.resolve()
-    return resolve_workspace_path(text)
+    return resolve_relative_path(text)
 
 
 def _resolve_whisper_cpp_model_path(value: str) -> Path | None:

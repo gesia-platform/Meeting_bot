@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -19,9 +20,13 @@ from zoom_meeting_bot_cli.skill_manager import (
     clear_meeting_output_override,
     describe_skill_state,
     finalize_composed_skill,
+    interpret_skill_compose_reply,
     list_generated_skill_assets,
     prepare_skill_compose_workspace,
+    resolve_codex_command,
     resolve_skill_asset_selection,
+    run_skill_compose_turn,
+    summarize_composed_skill_for_user,
     write_skill_compose_user_message,
 )
 
@@ -72,11 +77,66 @@ class SkillManagerTest(unittest.TestCase):
         self.assertIn("web search", prompt)
         self.assertIn("must first use web search", prompt)
         self.assertIn("Do not rely on prior model memory alone", prompt)
+        self.assertIn("Your user-facing reply must be Korean-only", prompt)
+        self.assertIn("READY:", prompt)
+        self.assertIn("QUESTION:", prompt)
+        self.assertIn("Prefer a well-shaped, specific override", prompt)
         self.assertIn("renderer_title_font", prompt)
         self.assertIn("renderer_cover_kicker", prompt)
         self.assertIn("result_block_order_mode", prompt)
         self.assertIn("show_overview", prompt)
         self.assertIn("section_numbering", prompt)
+
+    def test_interpret_skill_compose_reply_strips_english_diagnostics(self) -> None:
+        parsed = interpret_skill_compose_reply(
+            "READY: 카카오 분위기를 반영한 초안을 만들었습니다.\n\n"
+            "Sources: https://example.com\n"
+            "I couldn't run the repo validator in this shell.\n"
+        )
+
+        self.assertEqual(parsed["kind"], "ready")
+        self.assertEqual(parsed["text"], "카카오 분위기를 반영한 초안을 만들었습니다.")
+
+    def test_interpret_skill_compose_reply_replaces_english_only_reply_with_korean_fallback(self) -> None:
+        parsed = interpret_skill_compose_reply(
+            "Updated SKILL.md into a reusable NAVER-style result-generation override.\n"
+            "Sources: https://example.com\n"
+        )
+
+        self.assertEqual(parsed["kind"], "ready")
+        self.assertEqual(parsed["text"], "요청을 반영한 결과물 스타일 초안을 업데이트했습니다.")
+
+    def test_summarize_composed_skill_for_user_reports_key_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_path = Path(temp_dir) / "generated" / "demo" / "SKILL.md"
+            skill_path.parent.mkdir(parents=True, exist_ok=True)
+            skill_path.write_text(
+                "---\n"
+                'name: "kakao-demo"\n'
+                'description: "kakao style override"\n'
+                "metadata:\n"
+                '  renderer_theme_name: "KAKAO COMPANY MEETING"\n'
+                '  renderer_primary_color: "#FEE500"\n'
+                '  renderer_heading_font: "NanumSquare Round"\n'
+                '  renderer_body_font: "Pretendard"\n'
+                '  result_block_order: "overview, executive_summary, sections, decisions"\n'
+                '  show_risk_signals: "never"\n'
+                '  show_memo: "never"\n'
+                "---\n\n"
+                "# Demo\n",
+                encoding="utf-8",
+            )
+
+            summary = summarize_composed_skill_for_user(skill_path)
+
+        self.assertIn("결과물 스타일 초안을 저장했습니다.", summary)
+        self.assertIn("스타일 이름: kakao-demo", summary)
+        self.assertIn("분위기 방향: KAKAO COMPANY MEETING", summary)
+        self.assertIn("#FEE500", summary)
+        self.assertIn("NanumSquare Round", summary)
+        self.assertIn("회의 전체 요약", summary)
+        self.assertIn("핵심 논의 주제", summary)
+        self.assertIn("리스크 신호", summary)
 
     def test_compose_workspace_tracks_user_and_assistant_messages(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -91,6 +151,44 @@ class SkillManagerTest(unittest.TestCase):
             conversation = (workspace_dir / "CONVERSATION.md").read_text(encoding="utf-8")
             self.assertIn("## User", conversation)
             self.assertIn("## Assistant", conversation)
+
+    def test_run_skill_compose_turn_uses_supported_codex_exec_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            (workspace_dir / "BASE_SKILL.md").write_text("---\nname: base\ndescription: base\n---\n", encoding="utf-8")
+            (workspace_dir / "CONVERSATION.md").write_text("# Skill Compose Conversation\n", encoding="utf-8")
+            (workspace_dir / "USER_MESSAGE.md").write_text("테스트 요청\n", encoding="utf-8")
+            (workspace_dir / "SKILL.md").write_text("---\nname: \ndescription: \n---\n\n# Meeting Output Override\n", encoding="utf-8")
+
+            class Completed:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            with patch("zoom_meeting_bot_cli.skill_manager.subprocess.run", return_value=Completed()) as mocked_run:
+                result = run_skill_compose_turn(codex_command="codex", workspace_dir=workspace_dir)
+
+            self.assertEqual(result["exit_code"], 0)
+            command = mocked_run.call_args.args[0]
+            self.assertNotIn("--search", command)
+            self.assertNotIn("-a", command)
+            self.assertIn("--ephemeral", command)
+            self.assertIn("--skip-git-repo-check", command)
+
+    def test_resolve_codex_command_prefers_windows_direct_executable(self) -> None:
+        config = build_default_config()
+        config["local_ai"]["codex_command"] = "codex"
+
+        with patch("zoom_meeting_bot_cli.skill_manager.sys.platform", "win32"), patch(
+            "zoom_meeting_bot_cli.skill_manager.shutil.which",
+            side_effect=lambda name: {
+                "codex.exe": r"C:\Users\jung\.cursor\bin\codex.exe",
+                "codex": r"C:\Users\jung\AppData\Roaming\npm\codex.CMD",
+            }.get(name),
+        ):
+            resolved = resolve_codex_command(config)
+
+        self.assertEqual(resolved, r"C:\Users\jung\.cursor\bin\codex.exe")
 
     def test_finalize_composed_skill_copies_valid_skill_to_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

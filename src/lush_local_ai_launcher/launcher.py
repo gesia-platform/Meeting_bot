@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 from datetime import UTC, datetime, timedelta
 import json
 import os
@@ -23,6 +24,7 @@ from local_meeting_ai_runtime.storage import SessionStore
 PDF_HANDOFF_KIND = "telegram_summary_pdf"
 DEFAULT_STATE_PATH = Path(".tmp/local-ai-launcher/state.json")
 DEFAULT_POLL_SECONDS = 5.0
+STATUS_BOARD_REFRESH_SECONDS = 1.0
 RETRY_DELAYS_SECONDS = [0, 60, 300, 900, 1800, 1800]
 
 
@@ -66,17 +68,19 @@ def start_launcher() -> dict[str, Any]:
         "cwd": str(Path.cwd()),
         "stdin": subprocess.DEVNULL,
     }
-    with log_path.open("ab") as handle:
-        kwargs["stdout"] = handle
-        kwargs["stderr"] = handle
-        if os.name == "nt":
-            kwargs["creationflags"] = (
-                getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-                | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            )
-            process = subprocess.Popen(command, **kwargs)
-        else:  # pragma: no cover - non-Windows fallback
+    if os.name == "nt":
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+        kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+        kwargs["close_fds"] = True
+        process = subprocess.Popen(command, **kwargs)
+    else:  # pragma: no cover - non-Windows fallback
+        with log_path.open("ab") as handle:
+            kwargs["stdout"] = handle
+            kwargs["stderr"] = handle
             kwargs["start_new_session"] = True
             process = subprocess.Popen(command, **kwargs)
 
@@ -240,9 +244,13 @@ class LauncherSupervisor:
         self._finalizer_process: subprocess.Popen[Any] | None = None
         self._log_handles: list[Any] = []
         self._started_at = utcnow_iso()
+        self._interactive_console = False
+        self._last_status_board = ""
 
     def run(self) -> None:
         self._install_signal_handlers()
+        self._initialize_status_console()
+        self._set_console_title()
         self._zoom_process = self._spawn_process(
             "zoom-runtime.log",
             [sys.executable, "-m", "local_meeting_ai_runtime"],
@@ -260,17 +268,53 @@ class LauncherSupervisor:
             )
         try:
             self._write_state(status="running")
+            last_bridge_sync_at = 0.0
             while not self._stop_requested:
-                try:
-                    self._bridge.sync_once()
-                except Exception as exc:
-                    self._bridge._state["status"] = "degraded"
-                    self._bridge._state["last_error"] = str(exc).strip() or exc.__class__.__name__
+                now = time.time()
+                if now - last_bridge_sync_at >= DEFAULT_POLL_SECONDS:
+                    try:
+                        self._bridge.sync_once()
+                    except Exception as exc:
+                        self._bridge._state["status"] = "degraded"
+                        self._bridge._state["last_error"] = str(exc).strip() or exc.__class__.__name__
+                    last_bridge_sync_at = now
                 self._write_state()
-                time.sleep(DEFAULT_POLL_SECONDS)
+                self._render_status_board()
+                time.sleep(STATUS_BOARD_REFRESH_SECONDS)
         finally:
             self._shutdown_children()
             self._write_state(status="stopped")
+
+    def _set_console_title(self) -> None:
+        if not self._interactive_console or os.name != "nt":
+            return
+        try:
+            ctypes.windll.kernel32.SetConsoleTitleW("ZOOM_MEETING_BOT 상태")
+        except Exception:
+            return
+
+    def _initialize_status_console(self) -> None:
+        if os.name != "nt":
+            self._interactive_console = bool(sys.stdout.isatty())
+            return
+        try:
+            console_out = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+            console_err = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+            console_in = open("CONIN$", "r", encoding="utf-8", buffering=1)
+        except OSError:
+            self._interactive_console = bool(sys.stdout.isatty())
+            return
+        for stream_name in ("stdout", "stderr", "stdin"):
+            current = getattr(sys, stream_name, None)
+            try:
+                if current is not None and current not in {sys.__stdout__, sys.__stderr__, sys.__stdin__}:
+                    current.close()
+            except Exception:
+                pass
+        sys.stdout = console_out
+        sys.stderr = console_err
+        sys.stdin = console_in
+        self._interactive_console = True
 
     def _spawn_process(self, log_name: str, command: list[str]) -> subprocess.Popen[Any]:
         log_path = self._log_dir / log_name
@@ -364,6 +408,102 @@ class LauncherSupervisor:
             except OSError:
                 continue
         self._log_handles.clear()
+
+    def _render_status_board(self) -> None:
+        if not self._interactive_console:
+            return
+        board = self._build_status_board_text()
+        if board == self._last_status_board:
+            return
+        self._last_status_board = board
+        if os.name == "nt":
+            os.system("cls")
+        else:  # pragma: no cover - non-Windows fallback
+            print("\033[2J\033[H", end="")
+        print(board, end="", flush=True)
+
+    def _build_status_board_text(self) -> str:
+        snapshot = self._status_board_snapshot()
+        lines = [
+            "ZOOM_MEETING_BOT",
+            "실행 중인 회의와 결과물 진행 상황을 보여드리고 있습니다.",
+            "",
+            "시스템 상태",
+            "---------",
+            f"- 런처: {snapshot['launcher_label']}",
+            f"- Zoom 엔진: {snapshot['runtime_label']}",
+            f"- 결과물 마무리 엔진: {snapshot['finalizer_label']}",
+            "",
+            "현재 진행 상황",
+            "-------------",
+            f"- 세션 번호: {snapshot['session_id_label']}",
+            f"- 회의 상태: {snapshot['session_label']}",
+            f"- 지금 하는 일: {snapshot['activity_label']}",
+        ]
+        meeting_number_label = str(snapshot.get("meeting_number_label") or "").strip()
+        if meeting_number_label:
+            lines.insert(len(lines) - 2, f"- Zoom 회의 번호: {meeting_number_label}")
+        meeting_topic_label = str(snapshot.get("meeting_topic_label") or "").strip()
+        if meeting_topic_label:
+            lines.insert(len(lines) - 2, f"- 회의 제목: {meeting_topic_label}")
+        detail = str(snapshot.get("detail_label") or "").strip()
+        if detail:
+            lines.append(f"- 안내: {detail}")
+        updated_label = str(snapshot.get("updated_label") or "").strip()
+        if updated_label:
+            lines.append(f"- 마지막 업데이트: {updated_label}")
+        lines.extend(
+            [
+                "",
+                "안내",
+                "----",
+                "- 회의가 끝난 뒤에도 결과물 정리에는 시간이 조금 걸릴 수 있습니다.",
+                "- 이 창은 현재 진행 상황을 보여주는 상태판입니다.",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+
+    def _status_board_snapshot(self) -> dict[str, str]:
+        sessions = self._bridge._store.list_sessions()
+        session = _select_status_board_session(sessions)
+        launcher_running = self._zoom_process is not None and self._zoom_process.poll() is None
+        finalizer_enabled = _launcher_uses_finisher()
+        finalizer_running = self._finalizer_process is not None and self._finalizer_process.poll() is None
+        runtime_running = self._zoom_process is not None and self._zoom_process.poll() is None
+        if session is None:
+            return {
+                "launcher_label": "실행 중" if launcher_running else "중지됨",
+                "runtime_label": "실행 중" if runtime_running else "중지됨",
+                "finalizer_label": (
+                    "실행 중"
+                    if finalizer_running
+                    else ("준비됨" if finalizer_enabled else "사용 안 함")
+                ),
+                "session_id_label": "-",
+                "meeting_number_label": "",
+                "meeting_topic_label": "",
+                "session_label": "대기 중",
+                "activity_label": "새 회의를 기다리고 있습니다.",
+                "detail_label": "회의를 시작하면 이곳에 진행 상황이 표시됩니다.",
+                "updated_label": _friendly_timestamp_label(utcnow_iso()),
+            }
+        activity_label, detail_label = _friendly_session_activity(session)
+        return {
+            "launcher_label": "실행 중" if launcher_running else "중지됨",
+            "runtime_label": "실행 중" if runtime_running else "중지됨",
+            "finalizer_label": (
+                "실행 중"
+                if finalizer_running
+                else ("준비됨" if finalizer_enabled else "사용 안 함")
+            ),
+            "session_id_label": str(session.session_id or "").strip() or "-",
+            "meeting_number_label": str(session.meeting_number or "").strip(),
+            "meeting_topic_label": _friendly_meeting_topic(session),
+            "session_label": _friendly_session_state_label(session),
+            "activity_label": activity_label,
+            "detail_label": detail_label,
+            "updated_label": _friendly_timestamp_label(session.updated_at),
+        }
 
     def _install_signal_handlers(self) -> None:
         def _handler(_signum: int, _frame: Any) -> None:
@@ -836,6 +976,119 @@ class TelegramArtifactBridge:
         except (ValueError, json.JSONDecodeError):
             return {}
         return parsed if isinstance(parsed, dict) else {}
+
+
+def _select_status_board_session(sessions: list[DelegateSession]) -> DelegateSession | None:
+    if not sessions:
+        return None
+    sessions = [session for session in sessions if not _session_is_stale_status_candidate(session)]
+    if not sessions:
+        return None
+    sessions = sorted(sessions, key=lambda item: item.updated_at, reverse=True)
+    preferred = [
+        session
+        for session in sessions
+        if session.status in {"joining", "active", "suspected_ended", "blocked"} or _session_is_still_working(session)
+    ]
+    if preferred:
+        return preferred[0]
+    return sessions[0]
+
+
+def _session_is_still_working(session: DelegateSession) -> bool:
+    progress = dict(session.ai_state.get("user_progress") or {})
+    stage = str(progress.get("stage") or "").strip().lower()
+    if stage and stage not in {"completed", "export_failed"}:
+        return True
+    finalization = dict(session.ai_state.get("finalization") or {})
+    return str(finalization.get("status") or "").strip().lower() in {"queued", "processing"}
+
+
+def _session_is_stale_status_candidate(session: DelegateSession) -> bool:
+    heartbeat_at = _parse_iso_datetime(
+        str(dict(session.ai_state.get("shell_liveness") or {}).get("last_heartbeat_at") or "").strip()
+    )
+    created_at = _parse_iso_datetime(str(session.created_at or "").strip())
+    now = datetime.now(UTC)
+    content_count = len(session.transcript) + len(session.chat_history) + len(session.summary_exports)
+    if content_count > 0:
+        return False
+    if heartbeat_at is not None and (now - heartbeat_at) > timedelta(minutes=30):
+        return True
+    if created_at is not None and (now - created_at) > timedelta(days=2):
+        return True
+    return False
+
+
+def _friendly_meeting_topic(session: DelegateSession) -> str:
+    topic = str(session.meeting_topic or "").strip()
+    if not topic:
+        return ""
+    if topic in {
+        str(session.session_id or "").strip(),
+        str(session.meeting_number or "").strip(),
+        str(session.meeting_id or "").strip(),
+    }:
+        return ""
+    return topic
+
+
+def _friendly_session_state_label(session: DelegateSession) -> str:
+    mapping = {
+        "planned": "준비 중",
+        "joining": "입장 중",
+        "active": "회의 진행 중",
+        "suspected_ended": "종료 확인 중",
+        "blocked": "확인 필요",
+        "completed": "마무리됨",
+    }
+    return mapping.get(str(session.status or "").strip().lower(), "진행 중")
+
+
+def _friendly_session_activity(session: DelegateSession) -> tuple[str, str]:
+    progress = dict(session.ai_state.get("user_progress") or {})
+    message = str(progress.get("message") or "").strip()
+    detail = str(progress.get("detail") or "").strip()
+    if message:
+        return message, detail
+
+    finalization = dict(session.ai_state.get("finalization") or {})
+    finalization_status = str(finalization.get("status") or "").strip().lower()
+    if session.status == "joining":
+        return "회의에 참가하고 있습니다.", "브라우저에서 회의 입장을 준비하고 있습니다."
+    if session.status == "active":
+        return "회의 음성을 수집하고 있습니다.", "회의가 끝나면 자동으로 결과물을 준비합니다."
+    if session.status == "suspected_ended":
+        return "회의 종료를 확인하고 있습니다.", "회의가 끝난 것으로 보이면 결과물 준비를 시작합니다."
+    if finalization_status in {"queued", "processing"}:
+        return "회의 내용을 정리하고 있습니다.", "회의가 끝난 뒤 결과물을 준비하는 중입니다."
+    if session.status == "completed":
+        if session.summary_exports:
+            return "결과물이 준비되었습니다.", "이제 결과물을 확인하실 수 있습니다."
+        return "회의를 마무리하고 있습니다.", "결과물 파일을 정리하는 중입니다."
+    if session.status == "blocked":
+        return "회의를 시작하기 전에 확인이 필요합니다.", str(session.status_reason or "").strip()
+    return "새 회의를 기다리고 있습니다.", ""
+
+
+def _friendly_timestamp_label(raw: str) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return "방금 전"
+    parsed = _parse_iso_datetime(value)
+    if parsed is None:
+        return value
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_iso_datetime(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 class BlockingBridgeError(RuntimeError):

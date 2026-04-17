@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from .paths import workspace_root
 from .runtime_env import build_runtime_env, package_root, runtime_host, runtime_port, runtime_state_path
 
 
@@ -55,7 +56,8 @@ def start_runtime(config: dict[str, Any], *, config_path: Path) -> dict[str, Any
         "host": runtime_host(config),
         "port": runtime_port(config),
         "config_path": str(config_path.resolve()),
-        "workspace_dir": str(package_root()),
+        "workspace_dir": str(workspace_root()),
+        "package_dir": str(package_root()),
         "log_path": str(log_path),
         "started_at": _utcnow_iso(),
     }
@@ -91,7 +93,8 @@ def stop_runtime(config: dict[str, Any], *, config_path: Path) -> dict[str, Any]
         "host": runtime_host(config),
         "port": runtime_port(config),
         "config_path": str(config_path.resolve()),
-        "workspace_dir": str(package_root()),
+        "workspace_dir": str(workspace_root()),
+        "package_dir": str(package_root()),
         "stopped_at": _utcnow_iso(),
     }
     _write_json_atomic(state_path, stopped)
@@ -111,7 +114,8 @@ def read_runtime_status(config: dict[str, Any], *, config_path: Path) -> dict[st
             "host": host,
             "port": port,
             "config_path": str(config_path.resolve()),
-            "workspace_dir": str(package_root()),
+            "workspace_dir": str(workspace_root()),
+            "package_dir": str(package_root()),
             "state_path": str(state_path),
             "health": {"ok": False},
         }
@@ -128,7 +132,8 @@ def read_runtime_status(config: dict[str, Any], *, config_path: Path) -> dict[st
         "host": host,
         "port": port,
         "config_path": str(config_path.resolve()),
-        "workspace_dir": str(package_root()),
+        "workspace_dir": str(workspace_root()),
+        "package_dir": str(package_root()),
         "state_path": str(state_path),
         "health": health,
         "overview": overview,

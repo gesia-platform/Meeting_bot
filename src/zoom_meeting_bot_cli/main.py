@@ -9,13 +9,17 @@ import json
 import platform
 import re
 import shutil
+import sys
 import time
 import webbrowser
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from local_meeting_ai_runtime.assets import find_whisper_cpp_cli, find_whisper_cpp_model
+
 from .config import (
+    DEFAULT_WHISPER_CPP_MODEL_NAME,
     build_default_config,
     build_preset_config,
     default_config_path,
@@ -48,14 +52,22 @@ from .skill_manager import (
     clear_meeting_output_override,
     describe_skill_state,
     finalize_composed_skill,
+    interpret_skill_compose_reply,
     list_generated_skill_assets,
     prepare_skill_compose_workspace,
     resolve_codex_command,
     resolve_skill_asset_selection,
     run_skill_compose_turn,
+    summarize_composed_skill_for_user,
     write_skill_compose_user_message,
 )
-from .runtime_env import package_root, resolve_workspace_path, runtime_host, runtime_port, runtime_state_path
+from local_meeting_ai_runtime.meeting_output_skill import (
+    resolve_generated_meeting_output_dir,
+    resolve_meeting_output_skill_path,
+)
+
+from .paths import package_root, resolve_relative_path, resolve_workspace_path, workspace_root
+from .runtime_env import runtime_host, runtime_port, runtime_state_path
 from .model_manager import prepare_models
 from .package_manager import build_distribution_bundle
 from .platform_support import MACOS, command_candidates_exist, current_platform_id, tool_install_plans
@@ -105,9 +117,13 @@ ROUTE_MODE_CHOICES: list[tuple[str, str, str]] = [
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
     try:
+        _configure_utf8_stdio()
+        parsed_argv = list(sys.argv[1:] if argv is None else argv)
+        if not parsed_argv:
+            return handle_menu(argparse.Namespace(config=default_config_path()))
+        parser = build_parser()
+        args = parser.parse_args(parsed_argv)
         return args.func(args)
     except FileNotFoundError as exc:
         print(str(exc))
@@ -115,6 +131,18 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"Command failed: {exc}")
         return 1
+
+
+def _configure_utf8_stdio() -> None:
+    for stream_name in ("stdin", "stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -129,6 +157,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the bot config file. Defaults to ./zoom-meeting-bot.config.json",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    menu_parser = subparsers.add_parser(
+        "menu",
+        help="Open the Korean menu UI for everyday operation.",
+    )
+    menu_parser.set_defaults(func=handle_menu)
 
     init_parser = subparsers.add_parser("init", help="Create a new bot config file.")
     init_parser.add_argument("--force", action="store_true", help="Overwrite the config file if it already exists.")
@@ -451,6 +485,389 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def handle_menu(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    while True:
+        print()
+        print("ZOOM_MEETING_BOT")
+        print("----------------")
+        if config_path.exists():
+            print(f"설정 파일: {config_path.resolve()}")
+        else:
+            print(f"설정 파일이 아직 없습니다: {config_path.resolve()}")
+            print("처음 사용이라면 [1] 처음 설정하기를 먼저 진행해 주세요.")
+        print()
+        print("[1] 처음 설정하기")
+        print("[2] 런처 시작")
+        print("[3] 런처 중지")
+        print("[4] 회의 참가")
+        print("[5] 현재 상태 보기")
+        print("[6] 결과물 스타일 관리")
+        print("[0] 종료")
+        choice = input("\n번호를 선택해 주세요: ").strip().lower()
+
+        if choice in {"0", "q", "quit", "exit"}:
+            print("종료합니다.")
+            return 0
+        if choice == "1":
+            result = handle_quickstart(
+                argparse.Namespace(
+                    config=config_path,
+                    preset="launcher_dm",
+                    force_init=False,
+                    yes=True,
+                    skip_setup=False,
+                    skip_start=False,
+                )
+            )
+            _pause_menu()
+            continue
+        if choice == "2":
+            if not _menu_require_config(config_path):
+                _pause_menu()
+                continue
+            result = handle_start(argparse.Namespace(config=config_path))
+            _pause_menu()
+            continue
+        if choice == "3":
+            if not _menu_require_config(config_path):
+                _pause_menu()
+                continue
+            result = handle_stop(argparse.Namespace(config=config_path))
+            _pause_menu()
+            continue
+        if choice == "4":
+            result = _handle_menu_create_session(config_path)
+            _pause_menu()
+            continue
+        if choice == "5":
+            result = _handle_menu_show_status(config_path)
+            _pause_menu()
+            continue
+        if choice == "6":
+            result = _handle_menu_skill_library(config_path)
+            _pause_menu()
+            continue
+
+        print("올바른 번호를 선택해 주세요.")
+
+
+def _handle_menu_show_status(config_path: Path) -> int:
+    if not _menu_require_config(config_path):
+        return 1
+    config = _load_effective_config(config_path)
+    profile = dict(config.get("profile") or {})
+    telegram = dict(config.get("telegram") or {})
+    startup_blockers = _collect_startup_blockers(config)
+    execution_mode = _execution_mode(config)
+    mode_summary = _mode_summary(config)
+    state = describe_skill_state(config)
+    active_skill_label = _menu_active_skill_label(state)
+    launcher_status: dict[str, Any] | None = None
+    runtime_status: dict[str, Any] | None = None
+
+    try:
+        if execution_mode == "launcher":
+            launcher_status = read_full_launcher_status(config, config_path=config_path)
+            runtime_status = dict(launcher_status.get("zoom_runtime") or {})
+        else:
+            runtime_status = read_runtime_status(config, config_path=config_path)
+    except Exception as exc:
+        print("현재 상태를 읽는 중 문제가 생겼습니다.")
+        print(f"- {exc}")
+        return 1
+
+    launcher_running = str((launcher_status or {}).get("status") or "").strip().lower() == "running"
+    runtime_alive = bool(runtime_status and runtime_status.get("alive"))
+    finalizer_alive = bool(dict((launcher_status or {}).get("finalizer") or {}).get("alive"))
+    finalizer_enabled = bool(dict((launcher_status or {}).get("finalizer") or {}).get("enabled"))
+    readiness_label = "준비됨" if not startup_blockers else "점검 필요"
+
+    print("현재 상태")
+    print("---------")
+    print(f"- 봇 이름: {profile.get('bot_name') or '(미설정)'}")
+    print(f"- 작업 공간: {profile.get('workspace_name') or '(미설정)'}")
+    print(f"- 실행 방식: {mode_summary}")
+    print(f"- 설정 상태: {'완료' if config_path.exists() else '미설정'}")
+    print(f"- 회의 참가 준비: {readiness_label}")
+    if startup_blockers:
+        print(f"  점검 항목 {len(startup_blockers)}개가 있습니다.")
+    print(f"- 런처 상태: {'실행 중' if launcher_running else '중지됨' if execution_mode == 'launcher' else '사용 안 함'}")
+    print(f"- Zoom 엔진 상태: {'실행 중' if runtime_alive else '중지됨'}")
+    if execution_mode == "launcher":
+        if finalizer_enabled:
+            print(f"- 결과물 마무리 엔진: {'실행 중' if finalizer_alive else '중지됨'}")
+        else:
+            print("- 결과물 마무리 엔진: 사용 안 함")
+    print(f"- Telegram 연동: {'사용' if bool(telegram.get('enabled')) else '사용 안 함'}")
+    if bool(telegram.get("enabled")):
+        print(f"- PDF 전달 방식: {_describe_route(dict(telegram.get('artifact_route') or {}))}")
+    print(f"- 현재 결과물 스타일: {active_skill_label}")
+
+    if not _prompt_bool("상세 기술 정보도 볼까요", False):
+        return 0
+
+    print()
+    show_result = handle_show_config(
+        argparse.Namespace(
+            config=config_path,
+            json=False,
+        )
+    )
+    print()
+    print("런타임 상태")
+    print("-----------")
+    status_result = handle_status(argparse.Namespace(config=config_path))
+    print()
+    print("결과물 스타일 상태")
+    print("------------------")
+    skill_result = handle_skill_status(argparse.Namespace(config=config_path))
+    return max(show_result, status_result, skill_result)
+
+
+def _handle_menu_create_session(config_path: Path) -> int:
+    if not _menu_require_config(config_path):
+        return 1
+    args = _build_menu_create_session_args(config_path)
+    if args is None:
+        print("회의 참가를 취소했습니다.")
+        return 0
+    return handle_create_session(args)
+
+
+def _handle_menu_skill_compose(config_path: Path) -> int:
+    if not _menu_require_config(config_path):
+        return 1
+    config = _load_effective_config(config_path)
+    skill_state = describe_skill_state(config)
+    codex_command = resolve_codex_command(config)
+
+    print()
+    print("새 결과물 스타일 만들기")
+    print("-----------------------")
+    print("원하는 회의록 분위기와 요구사항을 편하게 말씀해 주세요.")
+    print("예: 회사 분위기, 색감, 폰트 느낌, 중요하게 다루고 싶은 파트, 이미지 필요 여부")
+    initial_request = _prompt_required("요구사항", "")
+    if initial_request.strip() == "/cancel":
+        print("취소했습니다.")
+        return 0
+
+    if codex_command:
+        target_path = build_interactive_skill_target_path(config, label="")
+        return _run_skill_compose_flow(
+            config=config,
+            config_path=config_path,
+            codex_command=codex_command,
+            base_skill_path=Path(skill_state["base_skill_path"]),
+            target_path=target_path,
+            initial_request=initial_request,
+            no_activate=False,
+        )
+
+    print("Codex를 찾지 못해서 지금은 새 결과물 스타일을 만들 수 없습니다.")
+    print("먼저 Codex 명령어 경로를 확인해 주세요.")
+    return 1
+
+
+def _handle_menu_skill_library(config_path: Path) -> int:
+    if not _menu_require_config(config_path):
+        return 1
+    while True:
+        print()
+        print("결과물 스타일 관리")
+        print("----------------")
+        print("[1] 현재 적용된 스타일 보기")
+        print("[2] 저장된 스타일 목록 보기")
+        print("[3] 다른 스타일로 바꾸기")
+        print("[4] 새 결과물 스타일 만들기")
+        print("[5] 기본 스타일로 되돌리기")
+        print("[0] 이전 메뉴로 돌아가기")
+        choice = input("\n번호를 선택해 주세요: ").strip().lower()
+
+        if choice in {"0", "b", "back"}:
+            return 0
+        if choice == "1":
+            _show_menu_skill_current(config_path)
+            continue
+        if choice == "2":
+            _show_menu_skill_assets(config_path)
+            continue
+        if choice == "3":
+            _handle_menu_skill_activate(config_path)
+            continue
+        if choice == "4":
+            _handle_menu_skill_compose(config_path)
+            continue
+        if choice == "5":
+            _handle_menu_skill_reset(config_path)
+            continue
+
+        print("올바른 번호를 선택해 주세요.")
+
+
+def _show_menu_skill_current(config_path: Path) -> int:
+    config = _load_effective_config(config_path)
+    state = describe_skill_state(config)
+    active_label = _menu_active_skill_label(state)
+
+    print()
+    print("현재 적용된 결과물 스타일")
+    print("------------------------")
+    print(f"- 현재 스타일: {active_label}")
+    print(f"- 기본 스타일: {state['base_skill_path']}")
+    if state["override_skill_path"]:
+        print(f"- 적용 중인 스타일: {state['override_skill_path']}")
+    else:
+        print("- 적용 중인 스타일: 없음 (기본 스타일 사용 중)")
+    return 0
+
+
+def _show_menu_skill_assets(config_path: Path) -> int:
+    config = _load_effective_config(config_path)
+    state = describe_skill_state(config)
+    assets = list_generated_skill_assets(config)
+
+    print()
+    print("저장된 결과물 스타일 목록")
+    print("------------------------")
+    print(f"- 생성된 스타일 폴더: {state['generated_skill_dir']}")
+    if not assets:
+        print("- 아직 생성된 결과물 스타일이 없습니다.")
+        print("- [4] 새 결과물 스타일 만들기로 먼저 스타일을 만들 수 있습니다.")
+        return 0
+
+    for asset in assets:
+        active_marker = " [현재 적용 중]" if asset.is_active else ""
+        print(f"{asset.index}. {asset.name}{active_marker}")
+        if asset.description:
+            print(f"   - 설명: {asset.description}")
+        print(f"   - 위치: {asset.relative_path}")
+    return 0
+
+
+def _handle_menu_skill_activate(config_path: Path) -> int:
+    config = _load_effective_config(config_path)
+    assets = list_generated_skill_assets(config)
+
+    print()
+    print("다른 결과물 스타일로 바꾸기")
+    print("--------------------------")
+    if not assets:
+        print("- 적용할 결과물 스타일이 아직 없습니다.")
+        print("- [4] 새 결과물 스타일 만들기로 먼저 만들어 주세요.")
+        return 0
+
+    for asset in assets:
+        active_marker = " [현재 적용 중]" if asset.is_active else ""
+        print(f"[{asset.index}] {asset.name}{active_marker}")
+    print("취소하려면 /cancel 을 입력해 주세요.")
+
+    selector = _prompt_menu_text("바꿀 스타일 번호", required=True)
+    if selector is None:
+        print("스타일 변경을 취소했습니다.")
+        return 0
+
+    selected = resolve_skill_asset_selection(assets, selector)
+    if selected is None:
+        print("올바른 번호를 고르지 못했습니다.")
+        return 1
+
+    activate_meeting_output_override(
+        config=config,
+        config_path=config_path,
+        skill_path=selected.path,
+        clear_customization=True,
+    )
+    print(f"현재 적용 스타일을 바꿨습니다: {selected.name}")
+    return 0
+
+
+def _handle_menu_skill_reset(config_path: Path) -> int:
+    config = _load_effective_config(config_path)
+    state = describe_skill_state(config)
+    print()
+    if not state["override_skill_path"]:
+        print("이미 기본 결과물 스타일을 사용 중입니다.")
+        return 0
+
+    clear_meeting_output_override(
+        config=config,
+        config_path=config_path,
+        clear_customization=False,
+    )
+    print("기본 결과물 스타일로 되돌렸습니다.")
+    return 0
+
+
+def _menu_require_config(config_path: Path) -> bool:
+    if config_path.exists():
+        return True
+    print("아직 설정 파일이 없습니다.")
+    print("먼저 [1] 처음 설정하기를 진행해 주세요.")
+    return False
+
+
+def _pause_menu() -> None:
+    print()
+    input("Enter를 누르면 메뉴로 돌아갑니다...")
+
+
+def _menu_active_skill_label(state: dict[str, str]) -> str:
+    override_path = str(state.get("override_skill_path") or "").strip()
+    if override_path:
+        return Path(override_path).parent.name
+    base_path = str(state.get("base_skill_path") or "").strip()
+    if base_path:
+        return f"기본 스타일 ({Path(base_path).parent.name})"
+    return "기본 스타일"
+
+
+def _build_menu_create_session_args(config_path: Path) -> argparse.Namespace | None:
+    print()
+    print("회의 참가")
+    print("---------")
+    print("회의 링크와 암호를 입력해 주세요.")
+    print("중간에 취소하려면 /cancel 을 입력하면 됩니다.")
+
+    join_url = _prompt_menu_text("회의 링크", required=True)
+    if join_url is None:
+        return None
+    passcode = _prompt_menu_text("암호", required=True)
+    if passcode is None:
+        return None
+
+    return argparse.Namespace(
+        config=config_path,
+        join_url=join_url,
+        passcode=passcode,
+        meeting_number="",
+        meeting_topic="",
+        requested_by="",
+        instructions="",
+        delegate_mode="answer_on_ask",
+        json=False,
+        open=True,
+        open_target="browser_auto",
+        no_start=False,
+        startup_wait_seconds=20.0,
+    )
+
+
+def _prompt_menu_text(label: str, *, required: bool = False, help_text: str = "") -> str | None:
+    while True:
+        if help_text:
+            print(f"   {help_text}")
+        value = input(f"{label}: ")
+        cleaned = sanitize_text_input(value).strip()
+        if cleaned == "/cancel":
+            return None
+        if cleaned:
+            return cleaned
+        if not required:
+            return ""
+        print("   빈 값으로 둘 수 없습니다. 취소하려면 /cancel 을 입력해 주세요.")
+
+
 def handle_init(args: argparse.Namespace) -> int:
     config_path: Path = args.config
     if config_path.exists() and not args.force:
@@ -487,7 +904,7 @@ def handle_skill_compose(args: argparse.Namespace) -> int:
     codex_command = "" if bool(args.fallback_only) else resolve_codex_command(config)
     initial_request = str(args.prompt or "").strip()
 
-    print("Result-generation skill compose")
+    print("새 결과물 스타일 만들기")
     print("원하는 회의 결과물 생성 방식을 자연어로 말씀해 주세요.")
     print("빈 줄 또는 /done 으로 마치고, /cancel 이면 저장 없이 종료합니다.")
 
@@ -516,13 +933,15 @@ def handle_skill_compose(args: argparse.Namespace) -> int:
                 text=pending_request,
             )
             print()
-            print("Assistant is drafting the skill...")
+            print("요청을 바탕으로 결과물 스타일 초안을 만들고 있습니다...")
             turn_result = run_skill_compose_turn(
                 codex_command=codex_command,
                 workspace_dir=Path(compose_workspace["sandbox_dir"]),
             )
             exit_code = int(turn_result["exit_code"])
-            assistant_reply = str(turn_result["assistant_reply"] or "").strip()
+            raw_assistant_reply = str(turn_result["assistant_reply"] or "").strip()
+            parsed_reply = interpret_skill_compose_reply(raw_assistant_reply)
+            assistant_reply = str(parsed_reply["text"] or "").strip()
             if assistant_reply:
                 append_skill_compose_message(
                     workspace_dir=Path(compose_workspace["sandbox_dir"]),
@@ -530,12 +949,17 @@ def handle_skill_compose(args: argparse.Namespace) -> int:
                     text=assistant_reply,
                 )
                 print()
-                print(f"Assistant: {assistant_reply}")
+                print(f"도우미: {assistant_reply}")
             if exit_code != 0:
                 print()
-                print("Skill compose assistant could not finish this turn cleanly.")
+                print("결과물 스타일 초안을 정상적으로 마무리하지 못했습니다.")
                 return 1
-            next_request = input("\nYou: ").strip()
+            prompt_label = (
+                "\n답변 또는 추가 요청(없으면 Enter): "
+                if parsed_reply["kind"] == "question"
+                else "\n추가 요청이 없으면 Enter를 눌러 저장합니다: "
+            )
+            next_request = input(prompt_label).strip()
             if not next_request or next_request == "/done":
                 break
             if next_request == "/cancel":
@@ -551,6 +975,7 @@ def handle_skill_compose(args: argparse.Namespace) -> int:
             return 1 if exit_code != 0 else 0
         print()
         print(f"새 skill을 저장했습니다: {finalized_skill_path}")
+        print(summarize_composed_skill_for_user(Path(finalized_skill_path)))
         if bool(args.no_activate):
             print("활성화는 건너뛰었습니다.")
             return 0
@@ -605,13 +1030,15 @@ def _run_skill_compose_flow(
             text=pending_request,
         )
         print()
-        print("Assistant is drafting the skill...")
+        print("요청을 바탕으로 결과물 스타일 초안을 만들고 있습니다...")
         turn_result = run_skill_compose_turn(
             codex_command=codex_command,
             workspace_dir=Path(compose_workspace["sandbox_dir"]),
         )
         exit_code = int(turn_result["exit_code"])
-        assistant_reply = str(turn_result["assistant_reply"] or "").strip()
+        raw_assistant_reply = str(turn_result["assistant_reply"] or "").strip()
+        parsed_reply = interpret_skill_compose_reply(raw_assistant_reply)
+        assistant_reply = str(parsed_reply["text"] or "").strip()
         if assistant_reply:
             append_skill_compose_message(
                 workspace_dir=Path(compose_workspace["sandbox_dir"]),
@@ -619,12 +1046,17 @@ def _run_skill_compose_flow(
                 text=assistant_reply,
             )
             print()
-            print(f"Assistant: {assistant_reply}")
+            print(f"도우미: {assistant_reply}")
         if exit_code != 0:
             print()
-            print("Skill compose assistant could not finish this turn cleanly.")
+            print("결과물 스타일 초안을 정상적으로 마무리하지 못했습니다.")
             return 1
-        next_request = input("\nYou: ").strip()
+        prompt_label = (
+            "\n답변 또는 추가 요청(없으면 Enter): "
+            if parsed_reply["kind"] == "question"
+            else "\n추가 요청이 없으면 Enter를 눌러 저장합니다: "
+        )
+        next_request = input(prompt_label).strip()
         if not next_request or next_request == "/done":
             break
         if next_request == "/cancel":
@@ -640,6 +1072,7 @@ def _run_skill_compose_flow(
         return 1 if exit_code != 0 else 0
     print()
     print(f"새 skill을 저장했습니다: {finalized_skill_path}")
+    print(summarize_composed_skill_for_user(Path(finalized_skill_path)))
     if no_activate:
         print("활성화는 건너뛰었습니다.")
         return 0
@@ -664,7 +1097,7 @@ def handle_skill_refine(args: argparse.Namespace) -> int:
     codex_command = "" if bool(args.fallback_only) else resolve_codex_command(config)
     feedback = str(args.prompt or "").strip()
 
-    print("Result-generation skill refine")
+    print("결과물 스타일 다듬기")
     print("이미 나온 회의 결과물을 본 뒤, 다음 결과물 생성 방식으로 쌓을 피드백을 말씀해 주세요.")
     if not feedback:
         feedback = _prompt_required("피드백", "")
@@ -868,7 +1301,8 @@ def handle_show_config(args: argparse.Namespace) -> int:
     sanitized = _sanitize_config_for_display(config)
     decorated = {
         "config_path": str(args.config.resolve()),
-        "workspace_dir": str(package_root()),
+        "workspace_dir": str(workspace_root()),
+        "package_dir": str(package_root()),
         "execution_mode": _execution_mode(config),
         "execution_mode_label": _choice_label(_execution_mode(config), EXECUTION_MODE_CHOICES),
         "completion_mode": _completion_mode(config),
@@ -886,7 +1320,8 @@ def handle_show_config(args: argparse.Namespace) -> int:
     print("설정 요약")
     print("---------")
     print(f"- config: {args.config.resolve()}")
-    print(f"- 작업 공간: {package_root()}")
+    print(f"- 작업 공간: {workspace_root()}")
+    print(f"- 패키지 위치: {package_root()}")
     print(f"- bot 이름: {profile.get('bot_name') or '(미설정)'}")
     print(f"- workspace 이름: {profile.get('workspace_name') or '(미설정)'}")
     print(f"- 실행 모드: {_mode_summary(config)}")
@@ -917,7 +1352,8 @@ def handle_support_bundle(args: argparse.Namespace) -> int:
     execution_mode = _execution_mode(config)
     bundle = {
         "generated_at": datetime.now().astimezone().isoformat(),
-        "workspace_dir": str(package_root()),
+        "workspace_dir": str(workspace_root()),
+        "package_dir": str(package_root()),
         "config_path": str(args.config.resolve()),
         "execution_mode": execution_mode,
         "mode_summary": _mode_summary(config),
@@ -1367,15 +1803,11 @@ def _resolved_paths(config: dict[str, Any]) -> dict[str, str]:
         "store_path": str(resolve_workspace_path(str(runtime.get("store_path") or "data/delegate_sessions.json"))),
         "exports_dir": str(resolve_workspace_path(str(runtime.get("exports_dir") or "data/exports"))),
         "audio_archive_dir": str(resolve_workspace_path(str(runtime.get("audio_archive_dir") or "data/audio"))),
-        "meeting_output_skill_path": str(
-            resolve_workspace_path(meeting_output_skill or "skills/meeting-output-default/SKILL.md")
-        ),
+        "meeting_output_skill_path": str(resolve_meeting_output_skill_path(meeting_output_skill or None)),
         "meeting_output_override_path": str(resolve_workspace_path(meeting_output_override))
         if meeting_output_override
         else "",
-        "generated_meeting_output_dir": str(
-            resolve_workspace_path(generated_skill_dir or "skills/generated")
-        ),
+        "generated_meeting_output_dir": str(resolve_generated_meeting_output_dir(generated_skill_dir or None)),
         "runtime_state_path": str(runtime_state_path(config)),
         "launcher_state_path": str(
             resolve_workspace_path(str(launcher.get("state_path") or ".tmp/zoom-meeting-bot/launcher-state.json"))
@@ -1595,22 +2027,6 @@ def _collect_interactive_config(config: dict[str, Any]) -> dict[str, Any]:
     )
 
     _print_section("4. 런타임")
-    updated["skills"]["meeting_output_path"] = _prompt(
-        "meeting output skill path",
-        str(dict(updated.get("skills") or {}).get("meeting_output_path") or ""),
-        help_text="Example: skills/meeting-output-default/SKILL.md",
-    )
-    updated["skills"]["meeting_output_customization"] = _prompt(
-        "meeting output customization",
-        str(dict(updated.get("skills") or {}).get("meeting_output_customization") or ""),
-        help_text="Optional natural-language request that will be expanded into a reusable generated skill.",
-    )
-    updated["skills"]["generated_meeting_output_dir"] = _prompt(
-        "generated meeting output dir",
-        str(dict(updated.get("skills") or {}).get("generated_meeting_output_dir") or ""),
-        help_text="Example: skills/generated",
-    )
-
     updated["runtime"]["execution_mode"] = _prompt_described_choice(
         "실행 모드",
         str(updated["runtime"]["execution_mode"]),
@@ -2236,12 +2652,15 @@ def _check_local_quality_dependencies(config: dict[str, Any], problems: list[str
     _check_python_module("pyannote.audio", "pyannote.audio", problems, required=True)
     whisper_cpp_command = str(local_ai.get("whisper_cpp_command") or "").strip()
     whisper_cpp_model = str(local_ai.get("whisper_cpp_model") or "").strip()
+    discovered_whisper_cpp_command = find_whisper_cpp_cli() if not whisper_cpp_command else None
+    discovered_whisper_cpp_model = find_whisper_cpp_model(DEFAULT_WHISPER_CPP_MODEL_NAME) if not whisper_cpp_model else None
     _check_optional_path(
         whisper_cpp_command,
         "whisper.cpp command",
         warnings,
         missing_message="whisper.cpp CLI path is not configured. Short live-audio fallback quality may differ from the golden reference.",
         expect_file=True,
+        discovered_path=discovered_whisper_cpp_command,
     )
     _check_optional_path(
         whisper_cpp_model,
@@ -2249,6 +2668,7 @@ def _check_local_quality_dependencies(config: dict[str, Any], problems: list[str
         warnings,
         missing_message="whisper.cpp model path is not configured. Short live-audio fallback quality may differ from the golden reference.",
         expect_file=True,
+        discovered_path=discovered_whisper_cpp_model,
     )
     if platform_id == MACOS and audio_mode in {"conversation", "mixed", "system"}:
         from local_meeting_ai_runtime.local_observer import LocalObserver
@@ -2336,9 +2756,13 @@ def _check_optional_path(
     *,
     missing_message: str,
     expect_file: bool,
+    discovered_path: Path | None = None,
 ) -> None:
     path_text = str(configured_path or "").strip()
     if not path_text:
+        if discovered_path is not None and (discovered_path.is_file() if expect_file else discovered_path.exists()):
+            _report(label, "ok", f"Found `{discovered_path}` automatically.")
+            return
         warnings.append(missing_message)
         _report(label, "warning", missing_message)
         return
@@ -2359,7 +2783,7 @@ def _resolve_optional_path_for_check(value: str) -> Path | None:
     if path.is_absolute():
         return path.resolve()
     if "/" in text or "\\" in text:
-        return resolve_workspace_path(text)
+        return resolve_relative_path(text)
     resolved = shutil.which(text)
     if resolved:
         return Path(resolved).resolve()
