@@ -2006,25 +2006,13 @@ def _collect_interactive_config(config: dict[str, Any]) -> dict[str, Any]:
         updated["local_ai"]["meeting_output_device"],
         help_text="예: Realtek HD Audio 2nd output(Realtek(R) Audio)",
     )
-    updated["local_ai"]["codex_command"] = _prompt("Codex 명령어", updated["local_ai"]["codex_command"])
-    updated["local_ai"]["pandoc_command"] = _prompt(
-        "pandoc 명령어 또는 절대 경로",
-        updated["local_ai"]["pandoc_command"],
+    updated["local_ai"]["codex_command"] = str(updated["local_ai"].get("codex_command") or "codex").strip() or "codex"
+    updated["local_ai"]["pandoc_command"] = str(updated["local_ai"].get("pandoc_command") or "pandoc").strip() or "pandoc"
+    updated["local_ai"]["libreoffice_command"] = (
+        str(updated["local_ai"].get("libreoffice_command") or "soffice").strip() or "soffice"
     )
-    updated["local_ai"]["libreoffice_command"] = _prompt(
-        "LibreOffice(soffice) 명령어 또는 절대 경로",
-        updated["local_ai"]["libreoffice_command"],
-    )
-    updated["local_ai"]["whisper_cpp_command"] = _prompt(
-        "whisper.cpp CLI 명령어 또는 절대 경로",
-        str(updated["local_ai"].get("whisper_cpp_command") or ""),
-        help_text="원본 품질 fallback을 맞추려면 whisper-cli.exe 경로를 넣는 편이 좋습니다.",
-    )
-    updated["local_ai"]["whisper_cpp_model"] = _prompt(
-        "whisper.cpp 모델(.bin) 경로",
-        str(updated["local_ai"].get("whisper_cpp_model") or ""),
-        help_text="예: ggml-large-v3-turbo-q5_0.bin",
-    )
+    updated["local_ai"]["whisper_cpp_command"] = str(updated["local_ai"].get("whisper_cpp_command") or "").strip()
+    updated["local_ai"]["whisper_cpp_model"] = str(updated["local_ai"].get("whisper_cpp_model") or "").strip()
 
     _print_section("4. 런타임")
     updated["runtime"]["execution_mode"] = _prompt_described_choice(
@@ -2032,18 +2020,10 @@ def _collect_interactive_config(config: dict[str, Any]) -> dict[str, Any]:
         str(updated["runtime"]["execution_mode"]),
         EXECUTION_MODE_CHOICES,
     )
-    updated["runtime"]["host"] = _prompt("런타임 host", str(updated["runtime"]["host"]))
-    updated["runtime"]["port"] = _prompt_int("런타임 port", int(updated["runtime"]["port"]))
-    updated["runtime"]["audio_mode"] = _prompt_choice(
-        "오디오 모드",
-        str(updated["runtime"]["audio_mode"]),
-        ("conversation", "mixed", "microphone", "system"),
-    )
-    updated["runtime"]["completion_mode"] = _prompt_described_choice(
-        "session completion mode",
-        str(updated["runtime"].get("completion_mode") or "inline"),
-        COMPLETION_MODE_CHOICES,
-    )
+    updated["runtime"]["host"] = runtime_host(updated)
+    updated["runtime"]["port"] = runtime_port(updated)
+    updated["runtime"]["audio_mode"] = str(updated["runtime"].get("audio_mode") or "conversation").strip() or "conversation"
+    updated["runtime"]["completion_mode"] = _completion_mode(updated)
     if str(updated["runtime"]["execution_mode"]) == "launcher":
         _print_section("5. Launcher")
         print("launcher 모드는 Zoom 런타임과 artifact 전달 계층을 함께 실행합니다.")
@@ -2328,8 +2308,8 @@ def _execution_mode(config: dict[str, Any]) -> str:
 
 def _completion_mode(config: dict[str, Any]) -> str:
     runtime = dict(config.get("runtime") or {})
-    mode = str(runtime.get("completion_mode") or "inline").strip()
-    return mode or "inline"
+    mode = str(runtime.get("completion_mode") or "queued").strip()
+    return mode or "queued"
 
 
 def _decorate_status_payload(config: dict[str, Any], config_path: Path, payload: dict[str, Any]) -> dict[str, Any]:

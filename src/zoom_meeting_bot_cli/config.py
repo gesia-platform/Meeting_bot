@@ -73,7 +73,7 @@ DEFAULT_CONFIG_TEMPLATE: dict[str, Any] = {
     },
     "runtime": {
         "execution_mode": "runtime_only",
-        "completion_mode": "inline",
+        "completion_mode": "queued",
         "host": "127.0.0.1",
         "port": 8787,
         "audio_mode": "conversation",

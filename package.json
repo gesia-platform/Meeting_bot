@@ -1,6 +1,6 @@
 {
   "name": "gesia-meeting-bot",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Global npm launcher for the Zoom Meeting Bot CLI kit.",
   "author": "GESIA Platform",
   "license": "UNLICENSED",
