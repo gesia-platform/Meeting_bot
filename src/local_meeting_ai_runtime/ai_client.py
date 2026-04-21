@@ -3803,7 +3803,7 @@ class AiDelegateClient:
     def _platform_supports_cpu_final_transcription(self) -> bool:
         if self._env_bool("DELEGATE_ALLOW_CPU_FINAL_TRANSCRIPTION", False):
             return True
-        return sys.platform == "darwin"
+        return sys.platform in {"darwin", "win32"}
 
     def _quality_backend(self, *, final_pass: bool) -> dict[str, Any]:
         gpu_ready = self._gpu_ready()

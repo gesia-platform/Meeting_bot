@@ -503,6 +503,7 @@ def handle_menu(args: argparse.Namespace) -> int:
         print("[4] 회의 참가")
         print("[5] 현재 상태 보기")
         print("[6] 결과물 스타일 관리")
+        print("[7] 전사 방법 확인")
         print("[0] 종료")
         choice = input("\n번호를 선택해 주세요: ").strip().lower()
 
@@ -546,6 +547,13 @@ def handle_menu(args: argparse.Namespace) -> int:
             continue
         if choice == "6":
             result = _handle_menu_skill_library(config_path)
+            _pause_menu()
+            continue
+        if choice == "7":
+            if not _menu_require_config(config_path):
+                _pause_menu()
+                continue
+            result = _handle_menu_show_transcription_method(config_path)
             _pause_menu()
             continue
 
@@ -603,6 +611,8 @@ def _handle_menu_show_status(config_path: Path) -> int:
     if bool(telegram.get("enabled")):
         print(f"- PDF 전달 방식: {_describe_route(dict(telegram.get('artifact_route') or {}))}")
     print(f"- 현재 결과물 스타일: {active_skill_label}")
+    transcription_status = _transcription_method_status(config)
+    print(f"- 최종 전사 방법: {transcription_status['label']}")
 
     if not _prompt_bool("상세 기술 정보도 볼까요", False):
         return 0
@@ -623,6 +633,85 @@ def _handle_menu_show_status(config_path: Path) -> int:
     print("------------------")
     skill_result = handle_skill_status(argparse.Namespace(config=config_path))
     return max(show_result, status_result, skill_result)
+
+
+def _handle_menu_show_transcription_method(config_path: Path) -> int:
+    if not _menu_require_config(config_path):
+        return 1
+    config = _load_effective_config(config_path)
+    status = _transcription_method_status(config)
+
+    print("전사 방법")
+    print("---------")
+    print(f"- 현재 경로: {status['label']}")
+    print(f"- 설명: {status['detail']}")
+    if status["gpu_detail"]:
+        print(f"- GPU 감지: {status['gpu_detail']}")
+    if status["torch_detail"]:
+        print(f"- torch 상태: {status['torch_detail']}")
+    print(f"- faster-whisper: {'준비됨' if status['faster_whisper_ready'] else '미설치'}")
+    print(f"- pyannote diarization: {'준비됨' if status['pyannote_ready'] else '미준비'}")
+    if status["notes"]:
+        print("- 참고:")
+        for note in status["notes"]:
+            print(f"  - {note}")
+    return 0
+
+
+def _cpu_final_fallback_supported(platform_id: str | None = None) -> bool:
+    resolved = str(platform_id or current_platform_id()).strip()
+    return resolved in {WINDOWS, MACOS}
+
+
+def _python_module_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except Exception:
+        return False
+
+
+def _transcription_method_status(config: dict[str, Any]) -> dict[str, Any]:
+    platform_id = current_platform_id()
+    local_ai = dict(config.get("local_ai") or {})
+    gpu_detected, gpu_detail = _detect_cuda_gpu()
+    torch_runtime = inspect_torch_runtime()
+    faster_whisper_ready = _python_module_available("faster_whisper")
+    hf_token = str(local_ai.get("huggingface_token") or "").strip()
+    pyannote_ready = bool(hf_token) and _python_module_available("pyannote.audio")
+    cpu_supported = _cpu_final_fallback_supported(platform_id)
+    notes: list[str] = []
+
+    if bool(torch_runtime.get("cuda_enabled")):
+        label = "GPU (CUDA)"
+        detail = "최종 전사는 GPU(CUDA)로 처리됩니다."
+    elif cpu_supported:
+        label = "CPU"
+        if gpu_detected:
+            detail = "GPU는 감지되었지만 torch CUDA 런타임을 쓰지 못해 CPU로 처리됩니다. 전사 시간이 더 오래 걸릴 수 있습니다."
+        else:
+            detail = "CUDA GPU가 없어 최종 전사를 CPU로 처리합니다. 전사 시간이 더 오래 걸릴 수 있습니다."
+    else:
+        label = "미준비"
+        detail = "이 환경에서는 최종 전사 경로가 아직 준비되지 않았습니다."
+
+    if not faster_whisper_ready:
+        notes.append("faster-whisper가 설치되어 있어야 최종 전사를 진행할 수 있습니다.")
+    if not hf_token:
+        notes.append("Hugging Face token이 없으면 diarization 품질 경로가 제한됩니다.")
+    elif not pyannote_ready:
+        notes.append("pyannote.audio가 준비되지 않아 diarization 품질 경로를 쓸 수 없습니다.")
+    if label == "CPU":
+        notes.append("CPU 경로는 GPU보다 훨씬 느릴 수 있습니다.")
+
+    return {
+        "label": label,
+        "detail": detail,
+        "gpu_detail": gpu_detail,
+        "torch_detail": str(torch_runtime.get("detail") or "").strip(),
+        "faster_whisper_ready": faster_whisper_ready,
+        "pyannote_ready": pyannote_ready,
+        "notes": notes,
+    }
 
 
 def _handle_menu_create_session(config_path: Path) -> int:
@@ -2575,6 +2664,7 @@ def _check_local_quality_dependencies(config: dict[str, Any], problems: list[str
     local_ai = dict(config.get("local_ai") or {})
     audio_mode = str(runtime.get("audio_mode") or "conversation").strip() or "conversation"
     platform_id = current_platform_id()
+    cpu_final_supported = _cpu_final_fallback_supported(platform_id)
     gpu_detected, gpu_detail = _detect_cuda_gpu()
     torch_runtime = inspect_torch_runtime()
 
@@ -2596,11 +2686,11 @@ def _check_local_quality_dependencies(config: dict[str, Any], problems: list[str
     if gpu_detected:
         _report("cuda_gpu", "ok", f"Detected CUDA-capable GPU via {gpu_detail}.")
     else:
-        if platform_id == MACOS:
+        if cpu_final_supported:
             _report(
                 "cuda_gpu",
                 "warning",
-                "CUDA-capable GPU was not detected. macOS will use the CPU final-offline transcription path when available.",
+                "CUDA-capable GPU was not detected. The kit will use the CPU final-offline transcription path.",
             )
         else:
             warnings.append("CUDA-capable GPU was not detected. The kit may need a fallback transcription path.")
@@ -2613,8 +2703,16 @@ def _check_local_quality_dependencies(config: dict[str, Any], problems: list[str
             "CUDA-capable GPU is present, but the installed torch runtime cannot use CUDA. "
             f"Re-run `{_script_cli_command('setup --yes')}` so quickstart/setup can install the CUDA torch runtime."
         )
-        problems.append(message)
-        _report("torch.cuda runtime", "missing", str(torch_runtime.get("detail") or message))
+        if cpu_final_supported:
+            warning_message = (
+                message
+                + " Until CUDA is restored, the kit will fall back to CPU final-offline transcription."
+            )
+            warnings.append(warning_message)
+            _report("torch.cuda runtime", "warning", str(torch_runtime.get("detail") or warning_message))
+        else:
+            problems.append(message)
+            _report("torch.cuda runtime", "missing", str(torch_runtime.get("detail") or message))
     elif bool(torch_runtime.get("installed")):
         _report("torch.cuda runtime", "warning", str(torch_runtime.get("detail") or "torch is installed without CUDA."))
     else:
