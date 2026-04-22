@@ -82,6 +82,7 @@ def create_app(
     async def startup() -> None:
         nonlocal watchdog_task
         await service.recover_incomplete_sessions()
+        await service.recover_live_audio_observers(requested_by="startup_recovery")
         watchdog_task = asyncio.create_task(service.run_auto_completion_watchdog())
 
     async def shutdown() -> None:

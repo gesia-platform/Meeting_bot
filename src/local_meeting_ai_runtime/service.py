@@ -122,6 +122,10 @@ class DelegateService:
             self._env_float("DELEGATE_SESSION_WATCHDOG_POLL_SECONDS", 5.0),
             1.0,
         )
+        self._audio_observer_recovery_cooldown_seconds = max(
+            self._env_float("DELEGATE_AUDIO_OBSERVER_RECOVERY_COOLDOWN_SECONDS", 15.0),
+            5.0,
+        )
         if self._auto_cleanup_enabled:
             self._run_storage_housekeeping()
 
@@ -899,8 +903,16 @@ class DelegateService:
             "last_error": None,
             "last_result": {},
         }
+        control["restart_payload"] = {
+            "seconds": seconds,
+            "interval_ms": interval_ms,
+            "audio_mode": audio_mode,
+            "metadata": dict(metadata),
+            **dict(control.get("payload") or {}),
+        }
         self._audio_observer_controls[session_id] = control
         session.ai_state["audio_observer"] = {
+            **dict(session.ai_state.get("audio_observer") or {}),
             "running": True,
             "seconds": seconds,
             "interval_ms": interval_ms,
@@ -912,18 +924,21 @@ class DelegateService:
             "frame_ms": control.get("frame_ms"),
             "silence_ms": control.get("silence_ms"),
             "started_at": control["started_at"],
+            "restart_payload": dict(control.get("restart_payload") or {}),
         }
         if bool(control.get("full_track_enabled")):
+            existing_full_track = dict(session.ai_state.get("full_track_capture") or {})
             session.ai_state["full_track_capture"] = {
+                **existing_full_track,
                 "running": True,
                 "strategy": (
                     "windows_native_full_track"
                     if str(control.get("capture_backend") or "") == "windows_native_helper"
-                    else "rolling_full_track"
+                    else str(existing_full_track.get("strategy") or "rolling_full_track")
                 ),
                 "chunk_seconds": float(control.get("full_track_chunk_seconds") or 0.0),
                 "started_at": control["started_at"],
-                "chunks": 0,
+                "chunks": int(existing_full_track.get("chunks") or 0),
             }
             session.ai_state.setdefault("full_track_capture_baseline", control["started_at"])
         self._reactivate_session(
@@ -1211,7 +1226,7 @@ class DelegateService:
                 **dict(observed_session.ai_state.get("full_track_capture") or {}),
                 "running": True,
                 "strategy": "windows_native_full_track",
-                "chunks": 1,
+                "chunks": int(dict(observed_session.ai_state.get("full_track_capture") or {}).get("chunks") or 0),
                 "last_archived_at": captured_at,
                 "helper_log_path": str(log_path),
                 "manifest_path": str(manifest_path),
@@ -2393,11 +2408,258 @@ class DelegateService:
                 pass
             await asyncio.sleep(self._session_watchdog_poll_seconds)
 
+    def _windows_helper_orphan_signature(self, microphone_path: Path, system_path: Path) -> str:
+        microphone_stat = microphone_path.stat()
+        system_stat = system_path.stat()
+        return "|".join(
+            [
+                f"microphone:{microphone_stat.st_size}:{int(microphone_stat.st_mtime_ns)}",
+                f"system:{system_stat.st_size}:{int(system_stat.st_mtime_ns)}",
+            ]
+        )
+
+    def _salvage_orphan_windows_helper_output(self, session: DelegateSession) -> tuple[DelegateSession, bool]:
+        full_track_state = dict(session.ai_state.get("full_track_capture") or {})
+        if str(full_track_state.get("strategy") or "").strip().lower() != "windows_native_full_track":
+            return session, False
+        if importlib.util.find_spec("soundfile") is None:
+            return session, False
+
+        helper_dir = Path(getattr(self._observer, "_artifact_dir", ".tmp/local-observer")) / (
+            f"windows-audio-helper-{session.session_id}"
+        )
+        microphone_path = helper_dir / "microphone-full-track.wav"
+        system_path = helper_dir / "system-full-track.wav"
+        manifest_path = helper_dir / "capture-manifest.json"
+        log_path = helper_dir / "capture.log"
+        if manifest_path.exists():
+            return session, False
+        if not microphone_path.exists() or not system_path.exists():
+            return session, False
+        if microphone_path.stat().st_size <= 0 or system_path.stat().st_size <= 0:
+            return session, False
+
+        signature = self._windows_helper_orphan_signature(microphone_path, system_path)
+        recovery_state = dict(session.ai_state.get("audio_observer_recovery") or {})
+        salvaged_signatures = [
+            str(item).strip()
+            for item in list(recovery_state.get("salvaged_signatures") or [])
+            if str(item).strip()
+        ]
+        if signature in salvaged_signatures:
+            return session, False
+
+        import soundfile as sf
+
+        try:
+            microphone_info = sf.info(str(microphone_path))
+            system_info = sf.info(str(system_path))
+        except Exception:
+            return session, False
+
+        captured_timestamp = max(microphone_path.stat().st_mtime, system_path.stat().st_mtime)
+        captured_at = datetime.fromtimestamp(captured_timestamp, tz=timezone.utc).astimezone().isoformat()
+        session = self._process_full_track_observations(
+            session,
+            microphone_observation=self._build_windows_full_track_observation(
+                path=microphone_path,
+                source="microphone",
+                capture_mode="full_track_microphone",
+                sample_rate=int(microphone_info.samplerate),
+                seconds=max(float(microphone_info.duration), 0.0),
+                channels=max(int(microphone_info.channels), 1),
+                device_name=str(
+                    dict(session.ai_state.get("audio_observer") or {})
+                    .get("restart_payload", {})
+                    .get("microphone_device_name")
+                    or ""
+                ),
+                captured_at=captured_at,
+            ),
+            system_observation=self._build_windows_full_track_observation(
+                path=system_path,
+                source="system",
+                capture_mode="full_track_system_audio",
+                sample_rate=int(system_info.samplerate),
+                seconds=max(float(system_info.duration), 0.0),
+                channels=max(int(system_info.channels), 1),
+                device_name=str(
+                    dict(session.ai_state.get("audio_observer") or {})
+                    .get("restart_payload", {})
+                    .get("system_device_name")
+                    or dict(session.ai_state.get("audio_observer") or {})
+                    .get("restart_payload", {})
+                    .get("meeting_output_device_name")
+                    or ""
+                ),
+                captured_at=captured_at,
+            ),
+        )
+        updated_full_track_state = {
+            **dict(session.ai_state.get("full_track_capture") or {}),
+            "running": False,
+            "strategy": "windows_native_full_track",
+            "chunks": int(dict(session.ai_state.get("full_track_capture") or {}).get("chunks") or 0),
+            "last_archived_at": captured_at,
+            "helper_log_path": str(log_path),
+            "manifest_path": str(manifest_path),
+            "last_salvaged_at": utcnow_iso(),
+            "last_salvaged_signature": signature,
+        }
+        session.ai_state["full_track_capture"] = updated_full_track_state
+        recovery_state.update(
+            {
+                "last_salvaged_at": utcnow_iso(),
+                "last_salvaged_signature": signature,
+                "salvaged_signatures": [*salvaged_signatures[-11:], signature],
+                "last_salvaged_paths": [str(microphone_path), str(system_path)],
+            }
+        )
+        session.ai_state["audio_observer_recovery"] = recovery_state
+        return self.persist_session(session), True
+
+    def _should_attempt_audio_observer_recovery(self, session: DelegateSession) -> bool:
+        if session.status == "completed":
+            return False
+        if self._finalization_blocks_live_updates(session):
+            return False
+        task = self._audio_observer_tasks.get(session.session_id)
+        if task is not None and not task.done():
+            return False
+
+        observer_state = dict(session.ai_state.get("audio_observer") or {})
+        if not bool(observer_state.get("continuous_mode")):
+            return False
+        restart_payload = dict(observer_state.get("restart_payload") or {})
+        if not restart_payload:
+            return False
+
+        shell_state = dict(session.ai_state.get("shell_liveness") or {})
+        heartbeat_ts = self._iso_to_timestamp(shell_state.get("last_heartbeat_at"))
+        if heartbeat_ts is None:
+            return False
+        now_ts = datetime.now().astimezone().timestamp()
+        if (now_ts - heartbeat_ts) >= self._session_heartbeat_timeout_seconds:
+            return False
+
+        observer_expected = (
+            bool(observer_state.get("running"))
+            or bool(shell_state.get("audio_observer_running"))
+            or bool(shell_state.get("joined"))
+            or bool(shell_state.get("completion_armed"))
+        )
+        if not observer_expected:
+            return False
+
+        recovery_state = dict(session.ai_state.get("audio_observer_recovery") or {})
+        last_attempt_ts = self._iso_to_timestamp(recovery_state.get("last_attempt_at"))
+        if last_attempt_ts is not None and (now_ts - last_attempt_ts) < self._audio_observer_recovery_cooldown_seconds:
+            return False
+        return True
+
+    async def _maybe_recover_live_audio_observer(
+        self,
+        session_id: str,
+        *,
+        requested_by: str,
+    ) -> dict[str, Any]:
+        session = self.get_session(session_id)
+        if session is None:
+            return {"session_id": session_id, "restarted": False, "salvaged": False, "error": "unknown_session"}
+        if not self._should_attempt_audio_observer_recovery(session):
+            return {"session_id": session_id, "restarted": False, "salvaged": False}
+
+        attempt_at = utcnow_iso()
+        recovery_state = dict(session.ai_state.get("audio_observer_recovery") or {})
+        recovery_state.update(
+            {
+                "last_attempt_at": attempt_at,
+                "requested_by": requested_by,
+            }
+        )
+        session.ai_state["audio_observer_recovery"] = recovery_state
+        session = self.persist_session(session)
+
+        salvaged = False
+        try:
+            session, salvaged = self._salvage_orphan_windows_helper_output(session)
+            restart_payload = dict(
+                dict(session.ai_state.get("audio_observer") or {}).get("restart_payload") or {}
+            )
+            if not restart_payload:
+                return {"session_id": session_id, "restarted": False, "salvaged": salvaged}
+            session, _status = await self.start_audio_observer(session_id, restart_payload)
+            recovery_state = dict(session.ai_state.get("audio_observer_recovery") or {})
+            recovery_state.update(
+                {
+                    "last_restarted_at": utcnow_iso(),
+                    "last_status": "restarted",
+                    "restart_count": int(recovery_state.get("restart_count") or 0) + 1,
+                    "requested_by": requested_by,
+                    "last_error": None,
+                    "last_error_at": None,
+                }
+            )
+            session.ai_state["audio_observer_recovery"] = recovery_state
+            self.persist_session(session)
+            return {"session_id": session_id, "restarted": True, "salvaged": salvaged}
+        except Exception as exc:
+            latest = self.get_session(session_id) or session
+            recovery_state = dict(latest.ai_state.get("audio_observer_recovery") or {})
+            recovery_state.update(
+                {
+                    "last_status": "failed",
+                    "last_error": str(exc).strip() or exc.__class__.__name__,
+                    "last_error_at": utcnow_iso(),
+                    "requested_by": requested_by,
+                }
+            )
+            latest.ai_state["audio_observer_recovery"] = recovery_state
+            self.persist_session(latest)
+            return {
+                "session_id": session_id,
+                "restarted": False,
+                "salvaged": salvaged,
+                "error": str(exc).strip() or exc.__class__.__name__,
+            }
+
+    async def recover_live_audio_observers(self, *, requested_by: str = "startup_recovery") -> dict[str, Any]:
+        restarted_session_ids: list[str] = []
+        salvaged_session_ids: list[str] = []
+        failed: list[dict[str, str]] = []
+        for session in self._store.list_sessions():
+            result = await self._maybe_recover_live_audio_observer(
+                session.session_id,
+                requested_by=requested_by,
+            )
+            if bool(result.get("salvaged")):
+                salvaged_session_ids.append(session.session_id)
+            if bool(result.get("restarted")):
+                restarted_session_ids.append(session.session_id)
+            elif str(result.get("error") or "").strip():
+                failed.append(
+                    {
+                        "session_id": session.session_id,
+                        "error": str(result.get("error") or "").strip(),
+                    }
+                )
+        return {
+            "restarted_session_ids": restarted_session_ids,
+            "salvaged_session_ids": salvaged_session_ids,
+            "failed": failed,
+        }
+
     async def scan_auto_completion_candidates(self) -> None:
         for session in self._store.list_sessions():
             if session.status == "completed":
                 continue
             if self._finalization_blocks_live_updates(session):
+                continue
+            recovery = await self._maybe_recover_live_audio_observer(
+                session.session_id,
+                requested_by="watchdog",
+            )
+            if bool(recovery.get("restarted")):
                 continue
             decision = self._auto_completion_watchdog_decision(session)
             action = str(decision.get("action") or "")
